@@ -1,0 +1,320 @@
+name: Build and Deploy to Deploys.app
+description: >-
+  Build a Dockerfile, push it to registry.deploys.app, and deploy — keyless via
+  GitHub OIDC. Pull requests get temporary preview deployments with a sticky
+  preview comment and GitHub deployment statuses.
+author: Deploys.app
+branding:
+  color: purple
+  icon: cloud
+
+inputs:
+  project:
+    description: Project ID
+    required: true
+  location:
+    description: Deploy location ID (e.g. gke.cluster-rcf2)
+    required: true
+  name:
+    description: >-
+      Base deployment name. Pull request runs deploy to <name>-pr-<number>.
+    required: true
+  context:
+    description: Docker build context
+    required: false
+    default: .
+  dockerfile:
+    description: Path to the Dockerfile (default <context>/Dockerfile)
+    required: false
+    default: ''
+  buildArgs:
+    description: Docker build args, one KEY=VALUE per line
+    required: false
+    default: ''
+  port:
+    description: Container port (WebService/TCPService)
+    required: false
+    default: '8080'
+  type:
+    description: Deployment type (WebService, Worker, TCPService, InternalTCPService)
+    required: false
+    default: WebService
+  env:
+    description: Environment variables for the deployment, one KEY=VALUE per line
+    required: false
+    default: ''
+  previewTtl:
+    description: >-
+      Preview deployment TTL (Ns/Nm/Nh/Nd), re-applied on every push so it
+      rolls. Previews are also deleted when the pull request closes.
+    required: false
+    default: 7d
+  apiEndpoint:
+    description: Deploys.app API endpoint
+    required: false
+    default: https://api.deploys.app
+  registry:
+    description: Deploys.app registry host
+    required: false
+    default: registry.deploys.app
+
+outputs:
+  deployment:
+    description: The deployed deployment name (base name, or <name>-pr-<n> for previews)
+    value: ${{ steps.plan.outputs.deployment }}
+  environment:
+    description: production, or pr-<n> for previews
+    value: ${{ steps.plan.outputs.environment }}
+  image:
+    description: The pushed image in digest form
+    value: ${{ steps.plan.outputs.image_ref }}@${{ steps.build.outputs.digest }}
+  url:
+    description: The deployed URL
+    value: ${{ steps.deploy.outputs.url }}
+
+runs:
+  using: composite
+  steps:
+    - id: auth
+      name: Exchange GitHub OIDC token for a deploys token
+      shell: bash
+      env:
+        API: ${{ inputs.apiEndpoint }}
+      run: |
+        set -euo pipefail
+
+        # The workflow needs `permissions: id-token: write`.
+        if [ -z "${ACTIONS_ID_TOKEN_REQUEST_URL:-}" ]; then
+          echo "::error::missing OIDC token support — add 'permissions: id-token: write' to the workflow" >&2
+          exit 1
+        fi
+        github_token=$(curl -sSf -H "Authorization: Bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+          "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=https://deploys.app" | jq -r '.value')
+        echo "::add-mask::$github_token"
+
+        resp=$(curl -sSf -X POST "$API/github.exchangetoken" \
+          -H 'Content-Type: application/json' \
+          -d "$(jq -n --arg t "$github_token" '{token: $t}')")
+        if [ "$(jq -r '.ok' <<<"$resp")" != "true" ]; then
+          echo "::error::token exchange failed: $(jq -r '.error.message // "unknown error"' <<<"$resp") — is this repository linked to the project? (github.link)" >&2
+          exit 1
+        fi
+        deploys_token=$(jq -r '.result.token' <<<"$resp")
+        echo "::add-mask::$deploys_token"
+
+        {
+          echo "github_token=$github_token"
+          echo "deploys_token=$deploys_token"
+        } >> "$GITHUB_OUTPUT"
+
+    - id: plan
+      name: Plan deployment
+      shell: bash
+      env:
+        BASE_NAME: ${{ inputs.name }}
+        PROJECT: ${{ inputs.project }}
+        REGISTRY: ${{ inputs.registry }}
+        EVENT_NAME: ${{ github.event_name }}
+        PR_NUMBER: ${{ github.event.pull_request.number }}
+        PREVIEW_TTL: ${{ inputs.previewTtl }}
+      run: |
+        set -euo pipefail
+
+        if [ "$EVENT_NAME" = "pull_request" ] || [ "$EVENT_NAME" = "pull_request_target" ]; then
+          deployment="$BASE_NAME-pr-$PR_NUMBER"
+          environment="pr-$PR_NUMBER"
+          pr_number="$PR_NUMBER"
+          # TTL: Ns/Nm/Nh/Nd -> seconds
+          if [[ "$PREVIEW_TTL" =~ ^([0-9]+)([smhd])$ ]]; then
+            n="${BASH_REMATCH[1]}"
+            case "${BASH_REMATCH[2]}" in
+              s) ttl=$((n));;
+              m) ttl=$((n * 60));;
+              h) ttl=$((n * 3600));;
+              d) ttl=$((n * 86400));;
+            esac
+          else
+            echo "::error::previewTtl must be <n>s|m|h|d (got '$PREVIEW_TTL')" >&2
+            exit 1
+          fi
+        else
+          deployment="$BASE_NAME"
+          environment="production"
+          pr_number=0
+          ttl=0
+        fi
+
+        if [ "${#deployment}" -gt 63 ]; then
+          echo "::error::deployment name '$deployment' exceeds 63 characters — shorten the name input" >&2
+          exit 1
+        fi
+
+        {
+          echo "deployment=$deployment"
+          echo "environment=$environment"
+          echo "pr_number=$pr_number"
+          echo "ttl=$ttl"
+          echo "image_ref=$REGISTRY/$PROJECT/$BASE_NAME"
+        } >> "$GITHUB_OUTPUT"
+
+    - id: notify-started
+      name: Report started
+      shell: bash
+      env:
+        API: ${{ inputs.apiEndpoint }}
+        GITHUB_OIDC: ${{ steps.auth.outputs.github_token }}
+        PROJECT: ${{ inputs.project }}
+        LOCATION: ${{ inputs.location }}
+        DEPLOYMENT: ${{ steps.plan.outputs.deployment }}
+        ENVIRONMENT: ${{ steps.plan.outputs.environment }}
+        PR_NUMBER: ${{ steps.plan.outputs.pr_number }}
+      run: |
+        set -euo pipefail
+        # Best-effort: a notify failure must not fail the build.
+        curl -sS -X POST "$API/github.notify" \
+          -H "Authorization: Bearer $GITHUB_OIDC" \
+          -H 'Content-Type: application/json' \
+          -d "$(jq -n \
+            --arg project "$PROJECT" --arg location "$LOCATION" \
+            --arg deployment "$DEPLOYMENT" --arg environment "$ENVIRONMENT" \
+            --argjson prNumber "$PR_NUMBER" \
+            --arg sha "$GITHUB_SHA" --arg ref "$GITHUB_REF" \
+            '{event: "started", project: $project, location: $location,
+              deployment: $deployment, environment: $environment,
+              prNumber: $prNumber, sha: $sha, ref: $ref}')" \
+          | jq -r 'if .ok then empty else "::warning::notify(started) failed: \(.error.message // "unknown error")" end' \
+          || echo "::warning::notify(started) failed"
+
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v3
+
+    - name: Log in to registry.deploys.app
+      uses: docker/login-action@v3
+      with:
+        registry: ${{ inputs.registry }}
+        username: oauth2accesstoken
+        password: ${{ steps.auth.outputs.deploys_token }}
+
+    - id: build
+      name: Build and push
+      uses: docker/build-push-action@v6
+      with:
+        context: ${{ inputs.context }}
+        file: ${{ inputs.dockerfile }}
+        build-args: ${{ inputs.buildArgs }}
+        push: true
+        tags: ${{ steps.plan.outputs.image_ref }}:${{ github.sha }}
+        cache-from: type=gha
+        cache-to: type=gha,mode=max
+
+    - id: deploy
+      name: Deploy
+      shell: bash
+      env:
+        API: ${{ inputs.apiEndpoint }}
+        DEPLOYS_TOKEN: ${{ steps.auth.outputs.deploys_token }}
+        PROJECT: ${{ inputs.project }}
+        LOCATION: ${{ inputs.location }}
+        DEPLOYMENT: ${{ steps.plan.outputs.deployment }}
+        IMAGE: ${{ steps.plan.outputs.image_ref }}@${{ steps.build.outputs.digest }}
+        TYPE: ${{ inputs.type }}
+        PORT: ${{ inputs.port }}
+        ENV_LINES: ${{ inputs.env }}
+        TTL: ${{ steps.plan.outputs.ttl }}
+      run: |
+        set -euo pipefail
+
+        # KEY=VALUE lines -> JSON object (empty lines ignored; any other
+        # malformed line is an error rather than silently dropped).
+        env_json=$(jq -Rn '
+          [inputs | select(length > 0)]
+          | if any(test("^[^=]+=") | not) then error("malformed line")
+            else map(capture("^(?<key>[^=]+)=(?<value>.*)$")) | from_entries end
+        ' <<<"$ENV_LINES" 2>/dev/null || true)
+        if [ -z "$env_json" ]; then
+          echo "::error::env must be KEY=VALUE lines (one per line)" >&2
+          exit 1
+        fi
+
+        body=$(jq -n \
+          --arg project "$PROJECT" --arg location "$LOCATION" \
+          --arg name "$DEPLOYMENT" --arg image "$IMAGE" \
+          --arg type "$TYPE" --argjson port "$PORT" \
+          --argjson env "$env_json" --argjson ttl "$TTL" \
+          '{project: $project, location: $location, name: $name, image: $image, type: $type, env: $env}
+           + (if $type == "WebService" or $type == "TCPService" or $type == "InternalTCPService" then {port: $port} else {} end)
+           + (if $ttl > 0 then {ttl: $ttl} else {} end)')
+
+        resp=$(curl -sSf -X POST "$API/deployment.deploy" \
+          -H "Authorization: Bearer $DEPLOYS_TOKEN" \
+          -H 'Content-Type: application/json' \
+          -d "$body")
+        if [ "$(jq -r '.ok' <<<"$resp")" != "true" ]; then
+          echo "::error::deploy failed: $(jq -r '.error.message // "unknown error"' <<<"$resp")" >&2
+          exit 1
+        fi
+
+        resp=$(curl -sSf -X POST "$API/deployment.get" \
+          -H "Authorization: Bearer $DEPLOYS_TOKEN" \
+          -H 'Content-Type: application/json' \
+          -d "$(jq -n --arg project "$PROJECT" --arg location "$LOCATION" --arg name "$DEPLOYMENT" \
+            '{project: $project, location: $location, name: $name}')")
+        url=$(jq -r 'if .ok then .result.url // "" else "" end' <<<"$resp")
+        echo "url=$url" >> "$GITHUB_OUTPUT"
+        echo "Deployed $DEPLOYMENT -> ${url:-<no url>}"
+
+    - name: Report success
+      if: success()
+      shell: bash
+      env:
+        API: ${{ inputs.apiEndpoint }}
+        GITHUB_OIDC: ${{ steps.auth.outputs.github_token }}
+        PROJECT: ${{ inputs.project }}
+        LOCATION: ${{ inputs.location }}
+        DEPLOYMENT: ${{ steps.plan.outputs.deployment }}
+        ENVIRONMENT: ${{ steps.plan.outputs.environment }}
+        PR_NUMBER: ${{ steps.plan.outputs.pr_number }}
+        URL: ${{ steps.deploy.outputs.url }}
+        IMAGE: ${{ steps.plan.outputs.image_ref }}@${{ steps.build.outputs.digest }}
+      run: |
+        set -euo pipefail
+        curl -sS -X POST "$API/github.notify" \
+          -H "Authorization: Bearer $GITHUB_OIDC" \
+          -H 'Content-Type: application/json' \
+          -d "$(jq -n \
+            --arg project "$PROJECT" --arg location "$LOCATION" \
+            --arg deployment "$DEPLOYMENT" --arg environment "$ENVIRONMENT" \
+            --argjson prNumber "$PR_NUMBER" \
+            --arg sha "$GITHUB_SHA" --arg ref "$GITHUB_REF" \
+            --arg url "$URL" --arg image "$IMAGE" \
+            '{event: "success", project: $project, location: $location,
+              deployment: $deployment, environment: $environment,
+              prNumber: $prNumber, sha: $sha, ref: $ref, url: $url, image: $image}')" \
+          | jq -r 'if .ok then empty else "::warning::notify(success) failed: \(.error.message // "unknown error")" end' \
+          || echo "::warning::notify(success) failed"
+
+    - name: Report failure
+      if: failure() && steps.auth.outcome == 'success' && steps.plan.outcome == 'success'
+      shell: bash
+      env:
+        API: ${{ inputs.apiEndpoint }}
+        GITHUB_OIDC: ${{ steps.auth.outputs.github_token }}
+        PROJECT: ${{ inputs.project }}
+        LOCATION: ${{ inputs.location }}
+        DEPLOYMENT: ${{ steps.plan.outputs.deployment }}
+        ENVIRONMENT: ${{ steps.plan.outputs.environment }}
+        PR_NUMBER: ${{ steps.plan.outputs.pr_number }}
+      run: |
+        set -euo pipefail
+        curl -sS -X POST "$API/github.notify" \
+          -H "Authorization: Bearer $GITHUB_OIDC" \
+          -H 'Content-Type: application/json' \
+          -d "$(jq -n \
+            --arg project "$PROJECT" --arg location "$LOCATION" \
+            --arg deployment "$DEPLOYMENT" --arg environment "$ENVIRONMENT" \
+            --argjson prNumber "$PR_NUMBER" \
+            --arg sha "$GITHUB_SHA" --arg ref "$GITHUB_REF" \
+            '{event: "failure", project: $project, location: $location,
+              deployment: $deployment, environment: $environment,
+              prNumber: $prNumber, sha: $sha, ref: $ref}')" \
+          >/dev/null || true
