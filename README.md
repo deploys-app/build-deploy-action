@@ -108,8 +108,9 @@ explicitly if you need a specific value.
 | `location` | yes | | Deploy location ID |
 | `name` | yes | | Base deployment name; PRs deploy to `<name>-pr-<n>` |
 | `mode` | | `dockerfile` | `dockerfile` (build+push an image) or `static` (build+publish a static site) |
-| `context` | | `.` | Docker build context (mode=dockerfile) |
-| `dockerfile` | | `<context>/Dockerfile` | Dockerfile path (mode=dockerfile) |
+| `workingDirectory` | | `.` | Root folder of the app to build (for monorepos, e.g. `apps/web`). dockerfile mode: the build context and default Dockerfile resolve under it. static mode: the build runs inside it and `outputDir` is read relative to it |
+| `context` | | `.` | Docker build context, resolved relative to `workingDirectory` (mode=dockerfile) |
+| `dockerfile` | | `<workingDirectory>/<context>/Dockerfile` | Dockerfile path, resolved relative to `workingDirectory` (mode=dockerfile) |
 | `buildArgs` | | | Docker build args, one `KEY=VALUE` per line (mode=dockerfile) |
 | `framework` | | `auto` | mode=static: `auto` (Hugo via `.tool-versions`/`hugo.toml`/`config.toml`, else Node via `package.json`), `hugo`, `node`, `none` |
 | `buildCommand` | | preset | mode=static: defaults to `hugo` (or `hugo --minify` if the Makefile uses it) / `npm run build`; required for `framework: none` |
@@ -121,6 +122,8 @@ explicitly if you need a specific value.
 | `port` | | `8080` | Container port (mode=dockerfile, WebService/TCPService) |
 | `type` | | `WebService` | mode=dockerfile: `WebService`, `Worker`, `TCPService`, `InternalTCPService` |
 | `env` | | | Deployment env vars, one `KEY=VALUE` per line |
+| `envGroups` | | | Env groups to attach, one per line or comma-separated; each must already exist in the project |
+| `pullSecret` | | | Pull secret name for a private image registry (mode=dockerfile); the secret must already exist in the deploy location |
 | `previewTtl` | | `7d` | Preview TTL (`30m`, `12h`, `7d`, …), refreshed on every push |
 | `apiEndpoint` | | `https://api.deploys.app` | API endpoint |
 | `registry` | | `registry.deploys.app` | Registry host (mode=dockerfile) |
