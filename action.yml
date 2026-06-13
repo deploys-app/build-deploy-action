@@ -26,12 +26,22 @@ inputs:
       and deploys it as a Static deployment (no image, no port, no registry).
     required: false
     default: dockerfile
+  workingDirectory:
+    description: >-
+      Root folder of the app to build, relative to the repo — for monorepos,
+      e.g. apps/web. In dockerfile mode the build context and the default
+      Dockerfile path resolve under it; in static mode the build command runs
+      inside it and outputDir is read relative to it. Defaults to the repo root.
+    required: false
+    default: .
   context:
-    description: Docker build context
+    description: Docker build context, resolved relative to workingDirectory
     required: false
     default: .
   dockerfile:
-    description: Path to the Dockerfile (default <context>/Dockerfile)
+    description: >-
+      Dockerfile path, resolved relative to workingDirectory
+      (default <workingDirectory>/<context>/Dockerfile)
     required: false
     default: ''
   buildArgs:
@@ -95,6 +105,19 @@ inputs:
     default: WebService
   env:
     description: Environment variables for the deployment, one KEY=VALUE per line
+    required: false
+    default: ''
+  envGroups:
+    description: >-
+      Env groups to attach to the deployment, one per line or comma-separated.
+      Each must already exist in the project (envGroup.create / the console).
+    required: false
+    default: ''
+  pullSecret:
+    description: >-
+      Pull secret name for the image registry (dockerfile mode only). Use this
+      when the deployment must authenticate to a private registry; the secret
+      must already exist in the deploy location. Ignored in static mode.
     required: false
     default: ''
   previewTtl:
@@ -183,6 +206,9 @@ runs:
         PREVIEW_TTL: ${{ inputs.previewTtl }}
         MODE: ${{ inputs.mode }}
         BASE_URL: ${{ inputs.baseUrl }}
+        WORKING_DIRECTORY: ${{ inputs.workingDirectory }}
+        CONTEXT: ${{ inputs.context }}
+        DOCKERFILE: ${{ inputs.dockerfile }}
       run: |
         set -euo pipefail
 
@@ -213,6 +239,36 @@ runs:
         if [ "${#deployment}" -gt 63 ]; then
           echo "::error::deployment name '$deployment' exceeds 63 characters — shorten the name input" >&2
           exit 1
+        fi
+
+        # Resolve the dockerfile-mode build context + Dockerfile under
+        # workingDirectory (the monorepo root folder). The build context is
+        # <workingDirectory>/<context>; an empty/`.` context just means the
+        # working directory itself. The Dockerfile, when given, is also relative
+        # to the working directory; when left blank we emit nothing so
+        # docker/build-push-action applies its own <context>/Dockerfile default
+        # (which, since context is the working directory, lands in the right
+        # folder). Paths are normalised to drop a leading "./" and collapse a
+        # trailing slash so the emitted values stay clean.
+        wd="${WORKING_DIRECTORY:-.}"; wd="${wd%/}"; [ -z "$wd" ] && wd="."
+        ctx_in="${CONTEXT:-.}"
+        if [ "$ctx_in" = "." ] || [ -z "$ctx_in" ]; then
+          eff_ctx="$wd"
+        elif [ "$wd" = "." ]; then
+          eff_ctx="$ctx_in"
+        else
+          eff_ctx="$wd/$ctx_in"
+        fi
+        eff_ctx="${eff_ctx#./}"; [ -z "$eff_ctx" ] && eff_ctx="."
+
+        eff_dockerfile=""
+        if [ -n "${DOCKERFILE:-}" ]; then
+          if [ "$wd" = "." ]; then
+            eff_dockerfile="$DOCKERFILE"
+          else
+            eff_dockerfile="$wd/$DOCKERFILE"
+          fi
+          eff_dockerfile="${eff_dockerfile#./}"
         fi
 
         # For static mode, resolve the planned deploy URL pre-build so the build
@@ -261,6 +317,8 @@ runs:
           echo "ttl=$ttl"
           echo "image_ref=$REGISTRY/$PROJECT/$BASE_NAME"
           echo "planned_url=$planned_url"
+          echo "context=$eff_ctx"
+          echo "dockerfile=$eff_dockerfile"
         } >> "$GITHUB_OUTPUT"
 
     - id: notify-started
@@ -308,8 +366,8 @@ runs:
       if: inputs.mode != 'static'
       uses: docker/build-push-action@v6
       with:
-        context: ${{ inputs.context }}
-        file: ${{ inputs.dockerfile }}
+        context: ${{ steps.plan.outputs.context }}
+        file: ${{ steps.plan.outputs.dockerfile }}
         build-args: ${{ inputs.buildArgs }}
         push: true
         tags: ${{ steps.plan.outputs.image_ref }}:${{ github.sha }}
@@ -326,8 +384,13 @@ runs:
         FRAMEWORK: ${{ inputs.framework }}
         BUILD_COMMAND: ${{ inputs.buildCommand }}
         NODE_VERSION: ${{ inputs.nodeVersion }}
+        WORKING_DIRECTORY: ${{ inputs.workingDirectory }}
       run: |
         set -euo pipefail
+
+        # Detect against the app folder (monorepo root folder), so config/toolchain
+        # signals are read from where the site actually lives.
+        cd "${WORKING_DIRECTORY:-.}"
 
         # Resolve framework: auto -> Hugo if a Hugo signal is present, else Node
         # if package.json is present, else error.
@@ -439,8 +502,13 @@ runs:
         OUTPUT_DIR: ${{ inputs.outputDir }}
         BASE_URL: ${{ inputs.baseUrl }}
         PLANNED_URL: ${{ steps.plan.outputs.planned_url }}
+        WORKING_DIRECTORY: ${{ inputs.workingDirectory }}
       run: |
         set -euo pipefail
+
+        # Build inside the app folder (monorepo root folder); outputDir is read
+        # relative to it.
+        cd "${WORKING_DIRECTORY:-.}"
 
         # Resolve the base URL to inject: explicit input wins, else the planned
         # deploy URL computed in the plan step.
@@ -502,8 +570,14 @@ runs:
         OUTPUT_DIR: ${{ inputs.outputDir }}
         SPA: ${{ inputs.spa }}
         NOT_FOUND: ${{ inputs.notFound }}
+        WORKING_DIRECTORY: ${{ inputs.workingDirectory }}
       run: |
         set -euo pipefail
+
+        # The built tree lives under the app folder (monorepo root folder); walk
+        # outputDir relative to it. curl targets absolute API URLs, so the cd is
+        # safe.
+        cd "${WORKING_DIRECTORY:-.}"
 
         base="$API/sites/$PROJECT/$DEPLOYMENT"
         out="${OUTPUT_DIR%/}"
@@ -673,6 +747,7 @@ runs:
         SITE_REF: ${{ steps.publish.outputs.site_ref }}
         RELEASE_SHA: ${{ steps.publish.outputs.release_sha }}
         ENV_LINES: ${{ inputs.env }}
+        ENV_GROUPS: ${{ inputs.envGroups }}
         TTL: ${{ steps.plan.outputs.ttl }}
       run: |
         set -euo pipefail
@@ -690,12 +765,20 @@ runs:
           exit 1
         fi
 
+        # Env groups: one per line or comma-separated, trimmed, blanks dropped.
+        # (Static deployments carry env + env groups but no pull secret — there
+        # is no pod pulling an image.)
+        groups_json=$(printf '%s' "$ENV_GROUPS" | tr ',' '\n' | jq -Rn '
+          [inputs | gsub("^\\s+|\\s+$"; "") | select(length > 0)]')
+
         # Static deploy: type=Static, site=<site_ref>, no image/port/registry.
         body=$(jq -n \
           --arg project "$PROJECT" --arg location "$LOCATION" \
           --arg name "$DEPLOYMENT" --arg site "$SITE_REF" \
-          --argjson env "$env_json" --argjson ttl "$TTL" \
+          --argjson env "$env_json" --argjson envGroups "$groups_json" \
+          --argjson ttl "$TTL" \
           '{project: $project, location: $location, name: $name, type: "Static", site: $site, env: $env}
+           + (if ($envGroups | length) > 0 then {envGroups: $envGroups} else {} end)
            + (if $ttl > 0 then {ttl: $ttl} else {} end)')
 
         resp=$(curl -sSf -X POST "$API/deployment.deploy" \
@@ -735,6 +818,8 @@ runs:
         TYPE: ${{ inputs.type }}
         PORT: ${{ inputs.port }}
         ENV_LINES: ${{ inputs.env }}
+        ENV_GROUPS: ${{ inputs.envGroups }}
+        PULL_SECRET: ${{ inputs.pullSecret }}
         TTL: ${{ steps.plan.outputs.ttl }}
       run: |
         set -euo pipefail
@@ -751,13 +836,20 @@ runs:
           exit 1
         fi
 
+        # Env groups: one per line or comma-separated, trimmed, blanks dropped.
+        groups_json=$(printf '%s' "$ENV_GROUPS" | tr ',' '\n' | jq -Rn '
+          [inputs | gsub("^\\s+|\\s+$"; "") | select(length > 0)]')
+
         body=$(jq -n \
           --arg project "$PROJECT" --arg location "$LOCATION" \
           --arg name "$DEPLOYMENT" --arg image "$IMAGE" \
           --arg type "$TYPE" --argjson port "$PORT" \
-          --argjson env "$env_json" --argjson ttl "$TTL" \
+          --argjson env "$env_json" --argjson envGroups "$groups_json" \
+          --arg pullSecret "$PULL_SECRET" --argjson ttl "$TTL" \
           '{project: $project, location: $location, name: $name, image: $image, type: $type, env: $env}
            + (if $type == "WebService" or $type == "TCPService" or $type == "InternalTCPService" then {port: $port} else {} end)
+           + (if ($envGroups | length) > 0 then {envGroups: $envGroups} else {} end)
+           + (if $pullSecret != "" then {pullSecret: $pullSecret} else {} end)
            + (if $ttl > 0 then {ttl: $ttl} else {} end)')
 
         resp=$(curl -sSf -X POST "$API/deployment.deploy" \
