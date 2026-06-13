@@ -19,6 +19,13 @@ inputs:
     description: >-
       Base deployment name. Pull request runs deploy to <name>-pr-<number>.
     required: true
+  mode:
+    description: >-
+      Build mode: `dockerfile` (default) builds and pushes a container image;
+      `static` builds a static site, uploads it as a content-addressed release,
+      and deploys it as a Static deployment (no image, no port, no registry).
+    required: false
+    default: dockerfile
   context:
     description: Docker build context
     required: false
@@ -29,6 +36,53 @@ inputs:
     default: ''
   buildArgs:
     description: Docker build args, one KEY=VALUE per line
+    required: false
+    default: ''
+  framework:
+    description: >-
+      Static build framework (mode=static only): `auto` (default) detects Hugo
+      via .tool-versions/hugo.toml/config.toml, else Node via package.json;
+      `hugo` forces Hugo extended; `node` forces Node; `none` requires an
+      explicit buildCommand.
+    required: false
+    default: auto
+  buildCommand:
+    description: >-
+      Static build command (mode=static only). Defaults per framework: Hugo ->
+      `hugo --minify` if the repo Makefile's build target uses it else `hugo`;
+      Node -> `npm run build`. Required when framework=none.
+    required: false
+    default: ''
+  outputDir:
+    description: >-
+      Built static tree to upload (mode=static only). `public` for Hugo,
+      `dist`/`build` for Node SPAs.
+    required: false
+    default: public
+  nodeVersion:
+    description: >-
+      Node toolchain version for the `node` framework (mode=static only).
+      Defaults to .nvmrc/.tool-versions, else 20.
+    required: false
+    default: ''
+  spa:
+    description: >-
+      SPA fallback to index.html on unknown routes (mode=static only). Default
+      false — Hugo sites are not SPAs (clean-URL resolution + a real 404). Set
+      true for Vite/React SPAs.
+    required: false
+    default: 'false'
+  notFound:
+    description: >-
+      Custom 404 document served on clean-URL misses when spa=false (mode=static
+      only).
+    required: false
+    default: 404.html
+  baseUrl:
+    description: >-
+      Build-time base URL (mode=static only). If empty, the action injects the
+      planned deploy URL (production or preview host, resolved via location.get)
+      so sitemap.xml/RSS carry the correct host.
     required: false
     default: ''
   port:
@@ -65,12 +119,19 @@ outputs:
   environment:
     description: production, or pr-<n> for previews
     value: ${{ steps.plan.outputs.environment }}
+  artifact:
+    description: >-
+      The deployed artifact: the pushed image in digest form (mode=dockerfile)
+      or the static release-sha (mode=static).
+    value: ${{ inputs.mode == 'static' && steps.deploy-static.outputs.artifact || steps.deploy.outputs.artifact }}
   image:
-    description: The pushed image in digest form
-    value: ${{ steps.plan.outputs.image_ref }}@${{ steps.build.outputs.digest }}
+    description: >-
+      Deprecated alias of `artifact` (the pushed image in digest form for
+      mode=dockerfile). Kept for one minor version; use `artifact`.
+    value: ${{ inputs.mode == 'static' && steps.deploy-static.outputs.artifact || steps.deploy.outputs.artifact }}
   url:
     description: The deployed URL
-    value: ${{ steps.deploy.outputs.url }}
+    value: ${{ inputs.mode == 'static' && steps.deploy-static.outputs.url || steps.deploy.outputs.url }}
 
 runs:
   using: composite
@@ -111,12 +172,17 @@ runs:
       name: Plan deployment
       shell: bash
       env:
+        API: ${{ inputs.apiEndpoint }}
+        DEPLOYS_TOKEN: ${{ steps.auth.outputs.deploys_token }}
         BASE_NAME: ${{ inputs.name }}
         PROJECT: ${{ inputs.project }}
+        LOCATION: ${{ inputs.location }}
         REGISTRY: ${{ inputs.registry }}
         EVENT_NAME: ${{ github.event_name }}
         PR_NUMBER: ${{ github.event.pull_request.number }}
         PREVIEW_TTL: ${{ inputs.previewTtl }}
+        MODE: ${{ inputs.mode }}
+        BASE_URL: ${{ inputs.baseUrl }}
       run: |
         set -euo pipefail
 
@@ -149,12 +215,52 @@ runs:
           exit 1
         fi
 
+        # For static mode, resolve the planned deploy URL pre-build so the build
+        # can bake the correct host into sitemap.xml / RSS. The host rule is the
+        # one the apiserver + deployer share: <deployment>-<numericProjectID>
+        # then <domainSuffix> (deployment_model.go deploymentHost / deployer
+        # main.go). The numeric project id comes from project.get, the domain
+        # suffix from location.get. If the user set baseUrl explicitly we skip
+        # the lookup. Best-effort: a lookup failure leaves planned_url empty and
+        # the build falls back to the repo default (the build is not failed on
+        # a missing SEO host).
+        planned_url=""
+        if [ "$MODE" = "static" ] && [ -z "$BASE_URL" ]; then
+          proj_resp=$(curl -sSf -X POST "$API/project.get" \
+            -H "Authorization: Bearer $DEPLOYS_TOKEN" \
+            -H 'Content-Type: application/json' \
+            -d "$(jq -n --arg project "$PROJECT" '{project: $project}')" || true)
+          project_id=$(jq -r 'if .ok then (.result.id // "") else "" end' <<<"$proj_resp" 2>/dev/null || true)
+
+          loc_resp=$(curl -sSf -X POST "$API/location.get" \
+            -H "Authorization: Bearer $DEPLOYS_TOKEN" \
+            -H 'Content-Type: application/json' \
+            -d "$(jq -n --arg id "$LOCATION" '{id: $id}')" || true)
+          domain_suffix=$(jq -r 'if .ok then (.result.domainSuffix // "") else "" end' <<<"$loc_resp" 2>/dev/null || true)
+
+          if [ -n "$project_id" ] && [ -n "$domain_suffix" ]; then
+            host="$deployment-$project_id"
+            # The apiserver falls back to the id-based kube name when this host
+            # label would exceed 63 chars; the action cannot know the kube id
+            # pre-build, so for the (rare) overflow we leave planned_url empty
+            # and let the build use its default rather than bake a wrong host.
+            if [ "${#host}" -le 63 ]; then
+              planned_url="https://$host$domain_suffix"
+            else
+              echo "::warning::planned host '$host$domain_suffix' exceeds 63 chars; skipping baseUrl injection (set baseUrl to override)"
+            fi
+          else
+            echo "::warning::could not resolve planned deploy URL (project.get/location.get); build will use its default base URL (set baseUrl to override)"
+          fi
+        fi
+
         {
           echo "deployment=$deployment"
           echo "environment=$environment"
           echo "pr_number=$pr_number"
           echo "ttl=$ttl"
           echo "image_ref=$REGISTRY/$PROJECT/$BASE_NAME"
+          echo "planned_url=$planned_url"
         } >> "$GITHUB_OUTPUT"
 
     - id: notify-started
@@ -186,9 +292,11 @@ runs:
           || echo "::warning::notify(started) failed"
 
     - name: Set up Docker Buildx
+      if: inputs.mode != 'static'
       uses: docker/setup-buildx-action@v3
 
     - name: Log in to registry.deploys.app
+      if: inputs.mode != 'static'
       uses: docker/login-action@v3
       with:
         registry: ${{ inputs.registry }}
@@ -197,6 +305,7 @@ runs:
 
     - id: build
       name: Build and push
+      if: inputs.mode != 'static'
       uses: docker/build-push-action@v6
       with:
         context: ${{ inputs.context }}
@@ -207,8 +316,414 @@ runs:
         cache-from: type=gha
         cache-to: type=gha,mode=max
 
+    # --- static build (mode == static) ---------------------------------------
+
+    - id: static-detect
+      name: Detect static framework
+      if: inputs.mode == 'static'
+      shell: bash
+      env:
+        FRAMEWORK: ${{ inputs.framework }}
+        BUILD_COMMAND: ${{ inputs.buildCommand }}
+        NODE_VERSION: ${{ inputs.nodeVersion }}
+      run: |
+        set -euo pipefail
+
+        # Resolve framework: auto -> Hugo if a Hugo signal is present, else Node
+        # if package.json is present, else error.
+        framework="$FRAMEWORK"
+        if [ "$framework" = "auto" ]; then
+          if [ -f .tool-versions ] && grep -qiE '^[[:space:]]*hugo[[:space:]]' .tool-versions; then
+            framework="hugo"
+          elif [ -f hugo.toml ] || [ -f hugo.yaml ] || [ -f hugo.json ] \
+            || [ -f config.toml ] || [ -f config.yaml ] || [ -f config.json ] \
+            || [ -d config ]; then
+            framework="hugo"
+          elif [ -f package.json ]; then
+            framework="node"
+          else
+            echo "::error::framework=auto could not detect Hugo (.tool-versions/hugo.toml/config.toml) or Node (package.json); set framework explicitly" >&2
+            exit 1
+          fi
+        fi
+
+        # Resolve the Hugo extended version from .tool-versions (mandatory: SCSS
+        # needs the extended binary). Default to a recent extended release if no
+        # pin is found.
+        hugo_version=""
+        if [ "$framework" = "hugo" ]; then
+          if [ -f .tool-versions ]; then
+            # ".tool-versions" lines look like: "hugo extended_0.161.1" or
+            # "hugo 0.161.1". peaceiris/actions-hugo wants a bare version, with
+            # the extended flag set separately.
+            raw=$(grep -iE '^[[:space:]]*hugo[[:space:]]' .tool-versions | head -n1 | awk '{print $2}' || true)
+            hugo_version="${raw#extended_}"
+          fi
+          if [ -z "$hugo_version" ]; then
+            hugo_version="0.161.1"
+            echo "::warning::no Hugo pin in .tool-versions; defaulting to extended $hugo_version"
+          fi
+        fi
+
+        # Resolve the Node version from input, then .nvmrc/.tool-versions, else 20.
+        node_version="$NODE_VERSION"
+        if [ "$framework" = "node" ] && [ -z "$node_version" ]; then
+          if [ -f .nvmrc ]; then
+            node_version=$(tr -d ' \tv' < .nvmrc | head -n1 || true)
+          fi
+          if [ -z "$node_version" ] && [ -f .tool-versions ]; then
+            node_version=$(grep -iE '^[[:space:]]*nodejs[[:space:]]' .tool-versions | head -n1 | awk '{print $2}' || true)
+          fi
+          if [ -z "$node_version" ]; then
+            node_version="20"
+          fi
+        fi
+
+        # Resolve the build command. Explicit input wins. Otherwise per preset:
+        #   hugo -> "hugo --minify" if the Makefile build target uses --minify,
+        #           else "hugo"
+        #   node -> "npm run build"
+        #   none -> required explicit command
+        build_command="$BUILD_COMMAND"
+        if [ -z "$build_command" ]; then
+          case "$framework" in
+            hugo)
+              if [ -f Makefile ] && grep -qE 'hugo([[:space:]]).*--minify' Makefile; then
+                build_command="hugo --minify"
+              else
+                build_command="hugo"
+              fi
+              ;;
+            node)
+              build_command="npm run build"
+              ;;
+            none)
+              echo "::error::framework=none requires an explicit buildCommand" >&2
+              exit 1
+              ;;
+            *)
+              echo "::error::unknown framework '$framework' (expected auto|hugo|node|none)" >&2
+              exit 1
+              ;;
+          esac
+        fi
+
+        {
+          echo "framework=$framework"
+          echo "hugo_version=$hugo_version"
+          echo "node_version=$node_version"
+          echo "build_command=$build_command"
+        } >> "$GITHUB_OUTPUT"
+        echo "Static build: framework=$framework command=$build_command"
+
+    - name: Set up Hugo
+      if: inputs.mode == 'static' && steps.static-detect.outputs.framework == 'hugo'
+      uses: peaceiris/actions-hugo@v3
+      with:
+        hugo-version: ${{ steps.static-detect.outputs.hugo_version }}
+        extended: true
+
+    - name: Set up Node
+      if: inputs.mode == 'static' && steps.static-detect.outputs.framework == 'node'
+      uses: actions/setup-node@v4
+      with:
+        node-version: ${{ steps.static-detect.outputs.node_version }}
+
+    - id: static-build
+      name: Build static site
+      if: inputs.mode == 'static'
+      shell: bash
+      env:
+        FRAMEWORK: ${{ steps.static-detect.outputs.framework }}
+        BUILD_COMMAND: ${{ steps.static-detect.outputs.build_command }}
+        OUTPUT_DIR: ${{ inputs.outputDir }}
+        BASE_URL: ${{ inputs.baseUrl }}
+        PLANNED_URL: ${{ steps.plan.outputs.planned_url }}
+      run: |
+        set -euo pipefail
+
+        # Resolve the base URL to inject: explicit input wins, else the planned
+        # deploy URL computed in the plan step.
+        base_url="$BASE_URL"
+        if [ -z "$base_url" ]; then
+          base_url="$PLANNED_URL"
+        fi
+
+        # Node frameworks: install deps reproducibly (npm ci when a lockfile is
+        # present, else npm install). Hugo needs no install step beyond the
+        # toolchain set up above.
+        if [ "$FRAMEWORK" = "node" ]; then
+          if [ -f package-lock.json ] || [ -f npm-shrinkwrap.json ]; then
+            npm ci
+          else
+            npm install
+          fi
+        fi
+
+        # Inject the base URL. Hugo reads HUGO_BASEURL directly. For Node
+        # frameworks the base-path env var is framework-specific (Vite reads
+        # BASE_URL/`--base`, Next reads its own config), so we export a few
+        # common names and document that the framework must read its own; we do
+        # not force a flag that an arbitrary framework may not understand.
+        if [ -n "$base_url" ]; then
+          if [ "$FRAMEWORK" = "hugo" ]; then
+            export HUGO_BASEURL="$base_url"
+            echo "HUGO_BASEURL=$base_url"
+          else
+            export BASE_URL="$base_url"
+            echo "BASE_URL=$base_url (the framework must read its own base-path env)"
+          fi
+        fi
+
+        echo "Running: $BUILD_COMMAND"
+        # Build a fresh tree. For Hugo, --cleanDestinationDir avoids shipping
+        # stale fingerprinted assets when the repo Makefile has no clean target.
+        if [ "$FRAMEWORK" = "hugo" ]; then
+          eval "$BUILD_COMMAND --cleanDestinationDir"
+        else
+          eval "$BUILD_COMMAND"
+        fi
+
+        if [ ! -d "$OUTPUT_DIR" ]; then
+          echo "::error::outputDir '$OUTPUT_DIR' does not exist after build" >&2
+          exit 1
+        fi
+
+    - id: publish
+      name: Publish static release
+      if: inputs.mode == 'static'
+      shell: bash
+      env:
+        API: ${{ inputs.apiEndpoint }}
+        DEPLOYS_TOKEN: ${{ steps.auth.outputs.deploys_token }}
+        PROJECT: ${{ inputs.project }}
+        DEPLOYMENT: ${{ steps.plan.outputs.deployment }}
+        ENVIRONMENT: ${{ steps.plan.outputs.environment }}
+        OUTPUT_DIR: ${{ inputs.outputDir }}
+        SPA: ${{ inputs.spa }}
+        NOT_FOUND: ${{ inputs.notFound }}
+      run: |
+        set -euo pipefail
+
+        base="$API/sites/$PROJECT/$DEPLOYMENT"
+        out="${OUTPUT_DIR%/}"
+
+        # --- a. open an upload session ---------------------------------------
+        sess_resp=$(curl -sSf -X POST "$base/uploads" \
+          -H "Authorization: Bearer $DEPLOYS_TOKEN")
+        session=$(jq -r 'if .ok then (.result.session // "") else "" end' <<<"$sess_resp")
+        if [ -z "$session" ]; then
+          echo "::error::failed to open upload session: $(jq -r '.error.message // "unknown error"' <<<"$sess_resp")" >&2
+          exit 1
+        fi
+
+        # lower lowercases its stdin (portable; avoids the bash-4 ${v,,} so the
+        # extension match works on any runner shell version).
+        lower() { tr '[:upper:]' '[:lower:]'; }
+
+        # Canonical extension -> Content-Type table (mirrors the apiserver
+        # extContentType map; SPEC §4.2/§4.5). The arg is the already-lowercased
+        # path. Returns application/octet-stream for unknown extensions.
+        content_type_for() {
+          case "$1" in
+            *.html)        echo "text/html; charset=utf-8" ;;
+            *.css)         echo "text/css; charset=utf-8" ;;
+            *.js|*.mjs)    echo "text/javascript; charset=utf-8" ;;
+            *.json)        echo "application/json; charset=utf-8" ;;
+            *.svg)         echo "image/svg+xml" ;;
+            *.xml)         echo "application/xml; charset=utf-8" ;;
+            *.txt)         echo "text/plain; charset=utf-8" ;;
+            *.map)         echo "application/json; charset=utf-8" ;;
+            *.png)         echo "image/png" ;;
+            *.jpg|*.jpeg)  echo "image/jpeg" ;;
+            *.webp)        echo "image/webp" ;;
+            *.gif)         echo "image/gif" ;;
+            *.ico)         echo "image/x-icon" ;;
+            *.avif)        echo "image/avif" ;;
+            *.woff2)       echo "font/woff2" ;;
+            *.woff)        echo "font/woff" ;;
+            *.ttf)         echo "font/ttf" ;;
+            *.wasm)        echo "application/wasm" ;;
+            *.pdf)         echo "application/pdf" ;;
+            *.mp4)         echo "video/mp4" ;;
+            *)             echo "application/octet-stream" ;;
+          esac
+        }
+
+        # Cache class: HTML-class for documents the gateway must revalidate
+        # (.html/.json/.xml/.txt/.map), immutable for everything else
+        # (fingerprinted assets — css/js/images/fonts/wasm). SPEC §4.6. The arg
+        # is the already-lowercased path.
+        cache_class_for() {
+          case "$1" in
+            *.html|*.json|*.xml|*.txt|*.map) echo "html" ;;
+            *) echo "immutable" ;;
+          esac
+        }
+
+        # --- b. walk outputDir; upload each blob; build the manifest files ----
+        # Collect "<request-path>\t<sha>\t<ct>\t<cache>" lines, then assemble the
+        # manifest with jq. request-path is the path relative to outputDir with a
+        # leading "/".
+        entries_file="$(mktemp)"
+        uploaded=0
+        skipped=0
+
+        while IFS= read -r -d '' f; do
+          rel="${f#"$out"/}"
+          reqpath="/$rel"
+          sha=$(sha256sum "$f" | cut -d' ' -f1)
+          lc=$(printf '%s' "$f" | lower)
+          ct=$(content_type_for "$lc")
+          cache=$(cache_class_for "$lc")
+
+          # PUT the blob (idempotent server-side: no-ops if it already exists).
+          # ct + cache travel as query params (apiserver reads ?ct= and ?cache=);
+          # the session as ?session=.
+          blob_resp=$(curl -sSf -X PUT "$base/blobs/$sha?session=$session&ct=$(jq -rn --arg v "$ct" '$v|@uri')&cache=$cache" \
+            -H "Authorization: Bearer $DEPLOYS_TOKEN" \
+            -H "Content-Type: $ct" \
+            --data-binary @"$f")
+          existed=$(jq -r 'if .ok then (.result.existed // false) else "err" end' <<<"$blob_resp")
+          if [ "$existed" = "err" ]; then
+            echo "::error::blob upload failed for $reqpath: $(jq -r '.error.message // "unknown error"' <<<"$blob_resp")" >&2
+            exit 1
+          fi
+          if [ "$existed" = "true" ]; then
+            skipped=$((skipped + 1))
+          else
+            uploaded=$((uploaded + 1))
+          fi
+
+          printf '%s\t%s\t%s\t%s\n' "$reqpath" "$sha" "$ct" "$cache" >> "$entries_file"
+        done < <(find "$out" -type f -print0)
+
+        echo "Uploaded $uploaded blob(s), $skipped already present."
+
+        # --- c. assemble the manifest, hash it, PUT the release ---------------
+        # Build the files object with jq, sorted by path (canonical). The bytes
+        # we hash MUST be exactly the bytes we PUT, so we write the manifest to a
+        # file, sha256sum THAT file, then --data-binary @file.
+        created_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+        case "$(printf '%s' "$SPA" | lower)" in
+          true|1|yes) spa_bool=true ;;
+          *)          spa_bool=false ;;
+        esac
+
+        files_json=$(jq -Rn '
+          [ inputs
+            | split("\t")
+            | { path: .[0], blob: .[1], ct: .[2], cache: .[3] }
+          ]
+          | sort_by(.path)
+          | map({ (.path): { blob: .blob, ct: .ct, cache: .cache } })
+          | add // {}
+        ' < "$entries_file")
+
+        # release-sha = sha256(the exact manifest bytes we PUT). The manifest's
+        # own "release" field would be circular (its value is the hash of the
+        # body that contains it), so we set "release" to "" inside the hashed
+        # body: the apiserver does not read the field (it only verifies
+        # sha256(received body) == the {release-sha} in the URL, then unmarshals
+        # and stores), and the gateway derives the release-sha from the
+        # Ingress-rewritten prefix, not from the body. We write the body to a
+        # file, sha256sum THAT file, and --data-binary @file the same bytes, so
+        # the hash and the uploaded bytes are provably identical.
+        body_file="$(mktemp)"
+        jq -nc \
+          --arg createdAt "$created_at" \
+          --arg environment "$ENVIRONMENT" \
+          --argjson spa "$spa_bool" \
+          --arg notFound "$NOT_FOUND" \
+          --argjson files "$files_json" \
+          '{ release: "", createdAt: $createdAt, environment: $environment,
+             spa: $spa, notFound: $notFound, files: $files }' \
+          > "$body_file"
+
+        release_sha=$(sha256sum "$body_file" | cut -d' ' -f1)
+
+        rel_resp=$(curl -sSf -X PUT "$base/releases/$release_sha?session=$session" \
+          -H "Authorization: Bearer $DEPLOYS_TOKEN" \
+          -H "Content-Type: application/json" \
+          --data-binary @"$body_file")
+        site_ref=$(jq -r 'if .ok then (.result.siteRef // "") else "" end' <<<"$rel_resp")
+        if [ -z "$site_ref" ]; then
+          echo "::error::release commit failed: $(jq -r '.error.message // "unknown error"' <<<"$rel_resp")" >&2
+          exit 1
+        fi
+
+        rm -f "$entries_file" "$body_file"
+
+        {
+          echo "release_sha=$release_sha"
+          echo "site_ref=$site_ref"
+        } >> "$GITHUB_OUTPUT"
+        echo "Published release $release_sha -> $site_ref"
+
+    - id: deploy-static
+      name: Deploy (static)
+      if: inputs.mode == 'static'
+      shell: bash
+      env:
+        API: ${{ inputs.apiEndpoint }}
+        DEPLOYS_TOKEN: ${{ steps.auth.outputs.deploys_token }}
+        PROJECT: ${{ inputs.project }}
+        LOCATION: ${{ inputs.location }}
+        DEPLOYMENT: ${{ steps.plan.outputs.deployment }}
+        SITE_REF: ${{ steps.publish.outputs.site_ref }}
+        RELEASE_SHA: ${{ steps.publish.outputs.release_sha }}
+        ENV_LINES: ${{ inputs.env }}
+        TTL: ${{ steps.plan.outputs.ttl }}
+      run: |
+        set -euo pipefail
+
+        # KEY=VALUE lines -> JSON object (empty lines ignored; any other
+        # malformed line is an error rather than silently dropped). Same parser
+        # as the container deploy step.
+        env_json=$(jq -Rn '
+          [inputs | select(length > 0)]
+          | if any(test("^[^=]+=") | not) then error("malformed line")
+            else map(capture("^(?<key>[^=]+)=(?<value>.*)$")) | from_entries end
+        ' <<<"$ENV_LINES" 2>/dev/null || true)
+        if [ -z "$env_json" ]; then
+          echo "::error::env must be KEY=VALUE lines (one per line)" >&2
+          exit 1
+        fi
+
+        # Static deploy: type=Static, site=<site_ref>, no image/port/registry.
+        body=$(jq -n \
+          --arg project "$PROJECT" --arg location "$LOCATION" \
+          --arg name "$DEPLOYMENT" --arg site "$SITE_REF" \
+          --argjson env "$env_json" --argjson ttl "$TTL" \
+          '{project: $project, location: $location, name: $name, type: "Static", site: $site, env: $env}
+           + (if $ttl > 0 then {ttl: $ttl} else {} end)')
+
+        resp=$(curl -sSf -X POST "$API/deployment.deploy" \
+          -H "Authorization: Bearer $DEPLOYS_TOKEN" \
+          -H 'Content-Type: application/json' \
+          -d "$body")
+        if [ "$(jq -r '.ok' <<<"$resp")" != "true" ]; then
+          echo "::error::deploy failed: $(jq -r '.error.message // "unknown error"' <<<"$resp")" >&2
+          exit 1
+        fi
+
+        resp=$(curl -sSf -X POST "$API/deployment.get" \
+          -H "Authorization: Bearer $DEPLOYS_TOKEN" \
+          -H 'Content-Type: application/json' \
+          -d "$(jq -n --arg project "$PROJECT" --arg location "$LOCATION" --arg name "$DEPLOYMENT" \
+            '{project: $project, location: $location, name: $name}')")
+        url=$(jq -r 'if .ok then .result.url // "" else "" end' <<<"$resp")
+        {
+          echo "url=$url"
+          echo "artifact=$RELEASE_SHA"
+        } >> "$GITHUB_OUTPUT"
+        echo "Deployed $DEPLOYMENT -> ${url:-<no url>} (release $RELEASE_SHA)"
+
+    # --- container deploy (mode != static) -----------------------------------
+
     - id: deploy
       name: Deploy
+      if: inputs.mode != 'static'
       shell: bash
       env:
         API: ${{ inputs.apiEndpoint }}
@@ -260,7 +775,10 @@ runs:
           -d "$(jq -n --arg project "$PROJECT" --arg location "$LOCATION" --arg name "$DEPLOYMENT" \
             '{project: $project, location: $location, name: $name}')")
         url=$(jq -r 'if .ok then .result.url // "" else "" end' <<<"$resp")
-        echo "url=$url" >> "$GITHUB_OUTPUT"
+        {
+          echo "url=$url"
+          echo "artifact=$IMAGE"
+        } >> "$GITHUB_OUTPUT"
         echo "Deployed $DEPLOYMENT -> ${url:-<no url>}"
 
     - name: Report success
@@ -274,8 +792,14 @@ runs:
         DEPLOYMENT: ${{ steps.plan.outputs.deployment }}
         ENVIRONMENT: ${{ steps.plan.outputs.environment }}
         PR_NUMBER: ${{ steps.plan.outputs.pr_number }}
-        URL: ${{ steps.deploy.outputs.url }}
-        IMAGE: ${{ steps.plan.outputs.image_ref }}@${{ steps.build.outputs.digest }}
+        # URL + artifact are mode-aware: static deploys come from the
+        # deploy-static step and carry the release-sha; container deploys come
+        # from the deploy step and carry the image digest. github.notify has only
+        # an `image` field — for static the apiserver stores the release-sha in
+        # the run's image column and renders it under a `Site:` label (it infers
+        # static from the deployment type, not from the body).
+        URL: ${{ inputs.mode == 'static' && steps.deploy-static.outputs.url || steps.deploy.outputs.url }}
+        IMAGE: ${{ inputs.mode == 'static' && steps.deploy-static.outputs.artifact || steps.deploy.outputs.artifact }}
       run: |
         set -euo pipefail
         curl -sS -X POST "$API/github.notify" \
