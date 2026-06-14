@@ -336,6 +336,11 @@ runs:
         DEPLOYMENT: ${{ steps.plan.outputs.deployment }}
         ENVIRONMENT: ${{ steps.plan.outputs.environment }}
         PR_NUMBER: ${{ steps.plan.outputs.pr_number }}
+        # The contributor's pushed commit. On pull_request events GITHUB_SHA is
+        # the synthetic refs/pull/N/merge merge commit (the apiserver binds it to
+        # the OIDC sha claim), so headSha carries the real commit for display.
+        # Empty on push/production, where GITHUB_SHA already is the pushed tip.
+        HEAD_SHA: ${{ github.event.pull_request.head.sha }}
       run: |
         set -euo pipefail
         # Best-effort: a notify failure must not fail the build.
@@ -346,10 +351,10 @@ runs:
             --arg project "$PROJECT" --arg location "$LOCATION" \
             --arg deployment "$DEPLOYMENT" --arg environment "$ENVIRONMENT" \
             --argjson prNumber "$PR_NUMBER" \
-            --arg sha "$GITHUB_SHA" --arg ref "$GITHUB_REF" \
+            --arg sha "$GITHUB_SHA" --arg headSha "$HEAD_SHA" --arg ref "$GITHUB_REF" \
             '{event: "started", project: $project, location: $location,
               deployment: $deployment, environment: $environment,
-              prNumber: $prNumber, sha: $sha, ref: $ref}')" \
+              prNumber: $prNumber, sha: $sha, headSha: $headSha, ref: $ref}')" \
           | jq -r 'if .ok then empty else "::warning::notify(started) failed: \(.error.message // "unknown error")" end' \
           || echo "::warning::notify(started) failed"
 
@@ -883,6 +888,9 @@ runs:
         # static from the deployment type, not from the body).
         URL: ${{ inputs.mode == 'static' && steps.deploy-static.outputs.url || steps.deploy.outputs.url }}
         IMAGE: ${{ inputs.mode == 'static' && steps.deploy-static.outputs.artifact || steps.deploy.outputs.artifact }}
+        # The contributor's pushed commit (see notify-started). Empty on
+        # push/production, where GITHUB_SHA already is the pushed tip.
+        HEAD_SHA: ${{ github.event.pull_request.head.sha }}
       run: |
         set -euo pipefail
         curl -sS -X POST "$API/github.notify" \
@@ -892,11 +900,11 @@ runs:
             --arg project "$PROJECT" --arg location "$LOCATION" \
             --arg deployment "$DEPLOYMENT" --arg environment "$ENVIRONMENT" \
             --argjson prNumber "$PR_NUMBER" \
-            --arg sha "$GITHUB_SHA" --arg ref "$GITHUB_REF" \
+            --arg sha "$GITHUB_SHA" --arg headSha "$HEAD_SHA" --arg ref "$GITHUB_REF" \
             --arg url "$URL" --arg image "$IMAGE" \
             '{event: "success", project: $project, location: $location,
               deployment: $deployment, environment: $environment,
-              prNumber: $prNumber, sha: $sha, ref: $ref, url: $url, image: $image}')" \
+              prNumber: $prNumber, sha: $sha, headSha: $headSha, ref: $ref, url: $url, image: $image}')" \
           | jq -r 'if .ok then empty else "::warning::notify(success) failed: \(.error.message // "unknown error")" end' \
           || echo "::warning::notify(success) failed"
 
@@ -911,6 +919,9 @@ runs:
         DEPLOYMENT: ${{ steps.plan.outputs.deployment }}
         ENVIRONMENT: ${{ steps.plan.outputs.environment }}
         PR_NUMBER: ${{ steps.plan.outputs.pr_number }}
+        # The contributor's pushed commit (see notify-started). Empty on
+        # push/production, where GITHUB_SHA already is the pushed tip.
+        HEAD_SHA: ${{ github.event.pull_request.head.sha }}
       run: |
         set -euo pipefail
         curl -sS -X POST "$API/github.notify" \
@@ -920,8 +931,8 @@ runs:
             --arg project "$PROJECT" --arg location "$LOCATION" \
             --arg deployment "$DEPLOYMENT" --arg environment "$ENVIRONMENT" \
             --argjson prNumber "$PR_NUMBER" \
-            --arg sha "$GITHUB_SHA" --arg ref "$GITHUB_REF" \
+            --arg sha "$GITHUB_SHA" --arg headSha "$HEAD_SHA" --arg ref "$GITHUB_REF" \
             '{event: "failure", project: $project, location: $location,
               deployment: $deployment, environment: $environment,
-              prNumber: $prNumber, sha: $sha, ref: $ref}')" \
+              prNumber: $prNumber, sha: $sha, headSha: $headSha, ref: $ref}')" \
           >/dev/null || true
