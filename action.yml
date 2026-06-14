@@ -95,6 +95,14 @@ inputs:
       so sitemap.xml/RSS carry the correct host.
     required: false
     default: ''
+  uploadConcurrency:
+    description: >-
+      How many static blobs to upload in parallel (mode=static only). Static
+      publish is round-trip bound — one small idempotent PUT per file — so
+      uploading concurrently is the dominant speedup. Default 16; raise it for
+      very large sites, or set 1 to force the old one-at-a-time behaviour.
+    required: false
+    default: '16'
   port:
     description: Container port (WebService/TCPService)
     required: false
@@ -580,6 +588,7 @@ runs:
         SPA: ${{ inputs.spa }}
         NOT_FOUND: ${{ inputs.notFound }}
         WORKING_DIRECTORY: ${{ inputs.workingDirectory }}
+        UPLOAD_CONCURRENCY: ${{ inputs.uploadConcurrency }}
       run: |
         set -euo pipefail
 
@@ -600,95 +609,167 @@ runs:
           exit 1
         fi
 
-        # lower lowercases its stdin (portable; avoids the bash-4 ${v,,} so the
-        # extension match works on any runner shell version).
-        lower() { tr '[:upper:]' '[:lower:]'; }
+        # Resolve the upload concurrency (positive integer; default 16). A bad
+        # value falls back rather than failing the publish.
+        jobs="${UPLOAD_CONCURRENCY:-16}"
+        if ! [[ "$jobs" =~ ^[0-9]+$ ]] || [ "$jobs" -lt 1 ]; then
+          echo "::warning::invalid uploadConcurrency '$jobs'; using 16"
+          jobs=16
+        fi
+
+        # The helpers below set a global (_ct/_cache/_enc) instead of echoing, so
+        # the per-file walk spawns no subshell — every byte of work is either the
+        # batched hash pass or the parallel uploads.
 
         # Canonical extension -> Content-Type table (mirrors the apiserver
         # extContentType map; SPEC §4.2/§4.5). The arg is the already-lowercased
-        # path. Returns application/octet-stream for unknown extensions.
+        # path. Sets _ct; application/octet-stream for unknown extensions.
         content_type_for() {
           case "$1" in
-            *.html)        echo "text/html; charset=utf-8" ;;
-            *.css)         echo "text/css; charset=utf-8" ;;
-            *.js|*.mjs)    echo "text/javascript; charset=utf-8" ;;
-            *.json)        echo "application/json; charset=utf-8" ;;
-            *.svg)         echo "image/svg+xml" ;;
-            *.xml)         echo "application/xml; charset=utf-8" ;;
-            *.txt)         echo "text/plain; charset=utf-8" ;;
-            *.map)         echo "application/json; charset=utf-8" ;;
-            *.png)         echo "image/png" ;;
-            *.jpg|*.jpeg)  echo "image/jpeg" ;;
-            *.webp)        echo "image/webp" ;;
-            *.gif)         echo "image/gif" ;;
-            *.ico)         echo "image/x-icon" ;;
-            *.avif)        echo "image/avif" ;;
-            *.woff2)       echo "font/woff2" ;;
-            *.woff)        echo "font/woff" ;;
-            *.ttf)         echo "font/ttf" ;;
-            *.wasm)        echo "application/wasm" ;;
-            *.pdf)         echo "application/pdf" ;;
-            *.mp4)         echo "video/mp4" ;;
-            *)             echo "application/octet-stream" ;;
+            *.html)        _ct="text/html; charset=utf-8" ;;
+            *.css)         _ct="text/css; charset=utf-8" ;;
+            *.js|*.mjs)    _ct="text/javascript; charset=utf-8" ;;
+            *.json)        _ct="application/json; charset=utf-8" ;;
+            *.svg)         _ct="image/svg+xml" ;;
+            *.xml)         _ct="application/xml; charset=utf-8" ;;
+            *.txt)         _ct="text/plain; charset=utf-8" ;;
+            *.map)         _ct="application/json; charset=utf-8" ;;
+            *.png)         _ct="image/png" ;;
+            *.jpg|*.jpeg)  _ct="image/jpeg" ;;
+            *.webp)        _ct="image/webp" ;;
+            *.gif)         _ct="image/gif" ;;
+            *.ico)         _ct="image/x-icon" ;;
+            *.avif)        _ct="image/avif" ;;
+            *.woff2)       _ct="font/woff2" ;;
+            *.woff)        _ct="font/woff" ;;
+            *.ttf)         _ct="font/ttf" ;;
+            *.wasm)        _ct="application/wasm" ;;
+            *.pdf)         _ct="application/pdf" ;;
+            *.mp4)         _ct="video/mp4" ;;
+            *)             _ct="application/octet-stream" ;;
           esac
         }
 
         # Cache class: HTML-class for documents the gateway must revalidate
         # (.html/.json/.xml/.txt/.map), immutable for everything else
         # (fingerprinted assets — css/js/images/fonts/wasm). SPEC §4.6. The arg
-        # is the already-lowercased path.
+        # is the already-lowercased path. Sets _cache.
         cache_class_for() {
           case "$1" in
-            *.html|*.json|*.xml|*.txt|*.map) echo "html" ;;
-            *) echo "immutable" ;;
+            *.html|*.json|*.xml|*.txt|*.map) _cache="html" ;;
+            *) _cache="immutable" ;;
           esac
         }
 
-        # --- b. walk outputDir; upload each blob; build the manifest files ----
-        # Collect "<path>\t<sha>\t<ct>\t<cache>" lines, then assemble the manifest
-        # with jq. The manifest key is the logical path relative to outputDir with
-        # NO leading slash (SPEC §5.3) — the gateway normalizes request paths to
-        # this slash-less form, so a leading slash would miss every lookup.
+        # Percent-encode a string for a query value (RFC 3986 unreserved set kept
+        # verbatim, everything else %XX). Sets _enc. Replaces the per-file
+        # `jq @uri` subshell; matters because '+' in image/svg+xml and the spaces
+        # in "; charset=utf-8" must not reach the server as a literal '+'/space.
+        urlencode() {
+          local s=$1 i c
+          _enc=
+          for (( i = 0; i < ${#s}; i++ )); do
+            c=${s:i:1}
+            case "$c" in
+              [a-zA-Z0-9.~_-]) _enc+=$c ;;
+              *) printf -v c '%%%02X' "'$c"; _enc+=$c ;;
+            esac
+          done
+        }
+
+        # upload_one PUTs a single content-addressed blob. Idempotent server-side:
+        # the apiserver checks existence before reading the body, so an already
+        # present blob returns existed=true without re-receiving the bytes (curl's
+        # Expect: 100-continue lets it skip sending them). It prints one marker
+        # byte to stdout — 'n' uploaded, 'e' already present — for the run tally,
+        # and returns non-zero (with an ::error:: line) on failure so xargs fails
+        # the whole step. Exported so the parallel `xargs ... bash -c` workers see
+        # it; base/session/DEPLOYS_TOKEN travel via the environment (never argv,
+        # so the token never lands in a process listing).
+        upload_one() {
+          local f=$1 sha=$2 ct=$3 ct_enc=$4 cache=$5 rel=$6 resp existed
+          if ! resp=$(curl -sS -X PUT "$base/blobs/$sha?session=$session&ct=$ct_enc&cache=$cache" \
+              -H "Authorization: Bearer $DEPLOYS_TOKEN" \
+              -H "Content-Type: $ct" \
+              --data-binary @"$f"); then
+            echo "::error::blob upload failed for $rel (curl error)" >&2
+            return 1
+          fi
+          existed=$(jq -r 'if .ok then (.result.existed // false) else "err" end' <<<"$resp")
+          case "$existed" in
+            true)  printf e ;;
+            false) printf n ;;
+            *)     echo "::error::blob upload failed for $rel: $(jq -r '.error.message // "unknown error"' <<<"$resp")" >&2
+                   return 1 ;;
+          esac
+        }
+        export -f upload_one
+        export base session DEPLOYS_TOKEN
+
+        # --- b. walk outputDir; upload every blob in parallel; build the manifest
+        # The manifest is assembled purely from the local tree (path/sha/ct/cache),
+        # so it does not depend on the upload responses — we hash once, fan the
+        # PUTs out across $jobs workers, then assemble. The manifest key is the
+        # logical path relative to outputDir with NO leading slash (SPEC §5.3): the
+        # gateway normalizes request paths to this slash-less form, so a leading
+        # slash would miss every lookup.
+        #
+        # entries_file: "<rel>\t<sha>\t<ct>\t<cache>" per line (newline-delimited,
+        #   the manifest source — unchanged from before, so the release bytes are
+        #   byte-identical to the sequential implementation).
+        # work_file: six NUL-delimited fields per file
+        #   (<f> <sha> <ct> <ct_enc> <cache> <rel>) for `xargs -0 -n6`, so any
+        #   spaces/special chars in a path or content-type survive intact.
         entries_file="$(mktemp)"
-        uploaded=0
-        skipped=0
+        work_file="$(mktemp)"
+        hash_file="$(mktemp)"
 
-        while IFS= read -r -d '' f; do
+        # Hash every file in one batched pass (a handful of sha256sum processes
+        # instead of one per file). Output is "<64-hex>  <path>" lines; the path
+        # starts at byte 66. find -print0 + xargs -0 keeps spaces safe; -r skips
+        # running sha256sum when the tree is empty. We hash into a file behind an
+        # explicit `if !` (set -o pipefail is on) rather than a process
+        # substitution so an unreadable file fails the publish loudly instead of
+        # being silently dropped from the manifest (and the live site).
+        if ! find "$out" -type f -print0 | xargs -0 -r sha256sum > "$hash_file"; then
+          echo "::error::failed to hash built files under '$out' (unreadable file?)" >&2
+          exit 1
+        fi
+
+        while IFS= read -r line; do
+          f=${line:66}
+          sha=${line:0:64}
           rel="${f#"$out"/}"
-          sha=$(sha256sum "$f" | cut -d' ' -f1)
-          lc=$(printf '%s' "$f" | lower)
-          ct=$(content_type_for "$lc")
-          cache=$(cache_class_for "$lc")
+          lc=${f,,}
+          content_type_for "$lc"
+          cache_class_for "$lc"
+          urlencode "$_ct"
+          printf '%s\t%s\t%s\t%s\n' "$rel" "$sha" "$_ct" "$_cache" >> "$entries_file"
+          printf '%s\0%s\0%s\0%s\0%s\0%s\0' "$f" "$sha" "$_ct" "$_enc" "$_cache" "$rel" >> "$work_file"
+        done < "$hash_file"
 
-          # PUT the blob (idempotent server-side: no-ops if it already exists).
-          # ct + cache travel as query params (apiserver reads ?ct= and ?cache=);
-          # the session as ?session=.
-          blob_resp=$(curl -sS -X PUT "$base/blobs/$sha?session=$session&ct=$(jq -rn --arg v "$ct" '$v|@uri')&cache=$cache" \
-            -H "Authorization: Bearer $DEPLOYS_TOKEN" \
-            -H "Content-Type: $ct" \
-            --data-binary @"$f")
-          existed=$(jq -r 'if .ok then (.result.existed // false) else "err" end' <<<"$blob_resp")
-          if [ "$existed" = "err" ]; then
-            echo "::error::blob upload failed for $rel: $(jq -r '.error.message // "unknown error"' <<<"$blob_resp")" >&2
-            exit 1
-          fi
-          if [ "$existed" = "true" ]; then
-            skipped=$((skipped + 1))
-          else
-            uploaded=$((uploaded + 1))
-          fi
+        # Fan the PUTs out. xargs exits 123 if any worker failed (each already
+        # printed its own ::error::); the markers it collects on stdout give the
+        # uploaded/already-present tally.
+        set +e
+        markers=$(xargs -0 -r -n6 -P "$jobs" bash -c 'upload_one "$@"' _ < "$work_file")
+        rc=$?
+        set -e
+        if [ "$rc" -ne 0 ]; then
+          echo "::error::one or more blob uploads failed (see messages above)" >&2
+          exit 1
+        fi
 
-          printf '%s\t%s\t%s\t%s\n' "$rel" "$sha" "$ct" "$cache" >> "$entries_file"
-        done < <(find "$out" -type f -print0)
-
-        echo "Uploaded $uploaded blob(s), $skipped already present."
+        uploaded=$(printf '%s' "$markers" | tr -cd n | wc -c | tr -d ' ')
+        skipped=$(printf '%s' "$markers" | tr -cd e | wc -c | tr -d ' ')
+        echo "Uploaded $uploaded blob(s), $skipped already present (concurrency $jobs)."
 
         # --- c. assemble the manifest, hash it, PUT the release ---------------
         # Build the files object with jq, sorted by path (canonical). The bytes
         # we hash MUST be exactly the bytes we PUT, so we write the manifest to a
         # file, sha256sum THAT file, then --data-binary @file.
         created_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-        case "$(printf '%s' "$SPA" | lower)" in
+        case "${SPA,,}" in
           true|1|yes) spa_bool=true ;;
           *)          spa_bool=false ;;
         esac
@@ -735,7 +816,7 @@ runs:
           exit 1
         fi
 
-        rm -f "$entries_file" "$body_file"
+        rm -f "$entries_file" "$work_file" "$hash_file" "$body_file"
 
         {
           echo "release_sha=$release_sha"
