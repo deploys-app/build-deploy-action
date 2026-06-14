@@ -90,9 +90,11 @@ jobs:
 ```
 
 The action installs Hugo extended pinned from `.tool-versions` (SCSS needs the
-extended binary), builds, then uploads only the files that changed (blobs are
-content-addressed and deduped). For a site that builds with `hugo --minify`
-(e.g. a Makefile `build:` target that uses it), set `buildCommand: hugo --minify`.
+extended binary), builds, then uploads the files in parallel (blobs are
+content-addressed and deduped, so anything already stored is skipped without
+re-sending its bytes — see `uploadConcurrency`). For a site that builds with
+`hugo --minify` (e.g. a Makefile `build:` target that uses it), set
+`buildCommand: hugo --minify`.
 
 For a Node/Vite SPA: `framework: node`, `outputDir: dist`, `spa: true`. The
 action runs `npm ci`/`npm install` then your `buildCommand` (default
@@ -119,6 +121,7 @@ explicitly if you need a specific value.
 | `spa` | | `false` | mode=static: SPA fallback to `index.html` on unknown routes (Hugo sites are not SPAs) |
 | `notFound` | | `404.html` | mode=static: custom 404 document served on clean-URL misses when `spa: false` |
 | `baseUrl` | | computed | mode=static: build-time base URL; if empty the action injects the planned deploy URL |
+| `uploadConcurrency` | | `16` | mode=static: how many blobs to upload in parallel; raise for very large sites, set `1` to force sequential uploads |
 | `port` | | `8080` | Container port (mode=dockerfile, WebService/TCPService) |
 | `type` | | `WebService` | mode=dockerfile: `WebService`, `Worker`, `TCPService`, `InternalTCPService` |
 | `env` | | | Deployment env vars, one `KEY=VALUE` per line (mode=dockerfile; ignored for static — no runtime container) |
@@ -160,9 +163,10 @@ explicitly if you need a specific value.
    so SEO artifacts carry the correct host.
 3. Detects the framework, installs the toolchain (Hugo extended pinned from
    `.tool-versions`, or Node), and runs the build into `outputDir`.
-4. Opens an upload session, uploads each file as a content-addressed blob
-   (skipping ones already present), assembles a manifest sorted by path with
-   `environment`/`spa`/`notFound`, and commits it as a release
+4. Opens an upload session, uploads the files as content-addressed blobs in
+   parallel (`uploadConcurrency`, default 16; ones already present are skipped
+   server-side without re-sending their bytes), assembles a manifest sorted by
+   path with `environment`/`spa`/`notFound`, and commits it as a release
    (`release-sha = sha256(manifest)`).
 5. Deploys with `type: Static` and `site: site://…@<release-sha>` — no image,
    no port. Previews carry a rolling TTL.
