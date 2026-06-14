@@ -176,7 +176,7 @@ runs:
           "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=https://deploys.app" | jq -r '.value')
         echo "::add-mask::$github_token"
 
-        resp=$(curl -sSf -X POST "$API/github.exchangetoken" \
+        resp=$(curl -sS -X POST "$API/github.exchangetoken" \
           -H 'Content-Type: application/json' \
           -d "$(jq -n --arg t "$github_token" '{token: $t}')")
         if [ "$(jq -r '.ok' <<<"$resp")" != "true" ]; then
@@ -282,13 +282,13 @@ runs:
         # a missing SEO host).
         planned_url=""
         if [ "$MODE" = "static" ] && [ -z "$BASE_URL" ]; then
-          proj_resp=$(curl -sSf -X POST "$API/project.get" \
+          proj_resp=$(curl -sS -X POST "$API/project.get" \
             -H "Authorization: Bearer $DEPLOYS_TOKEN" \
             -H 'Content-Type: application/json' \
             -d "$(jq -n --arg project "$PROJECT" '{project: $project}')" || true)
           project_id=$(jq -r 'if .ok then (.result.id // "") else "" end' <<<"$proj_resp" 2>/dev/null || true)
 
-          loc_resp=$(curl -sSf -X POST "$API/location.get" \
+          loc_resp=$(curl -sS -X POST "$API/location.get" \
             -H "Authorization: Bearer $DEPLOYS_TOKEN" \
             -H 'Content-Type: application/json' \
             -d "$(jq -n --arg id "$LOCATION" '{id: $id}')" || true)
@@ -583,7 +583,7 @@ runs:
         out="${OUTPUT_DIR%/}"
 
         # --- a. open an upload session ---------------------------------------
-        sess_resp=$(curl -sSf -X POST "$base/uploads" \
+        sess_resp=$(curl -sS -X POST "$base/uploads" \
           -H "Authorization: Bearer $DEPLOYS_TOKEN")
         session=$(jq -r 'if .ok then (.result.session // "") else "" end' <<<"$sess_resp")
         if [ -z "$session" ]; then
@@ -654,7 +654,7 @@ runs:
           # PUT the blob (idempotent server-side: no-ops if it already exists).
           # ct + cache travel as query params (apiserver reads ?ct= and ?cache=);
           # the session as ?session=.
-          blob_resp=$(curl -sSf -X PUT "$base/blobs/$sha?session=$session&ct=$(jq -rn --arg v "$ct" '$v|@uri')&cache=$cache" \
+          blob_resp=$(curl -sS -X PUT "$base/blobs/$sha?session=$session&ct=$(jq -rn --arg v "$ct" '$v|@uri')&cache=$cache" \
             -H "Authorization: Bearer $DEPLOYS_TOKEN" \
             -H "Content-Type: $ct" \
             --data-binary @"$f")
@@ -716,7 +716,7 @@ runs:
 
         release_sha=$(sha256sum "$body_file" | cut -d' ' -f1)
 
-        rel_resp=$(curl -sSf -X PUT "$base/releases/$release_sha?session=$session" \
+        rel_resp=$(curl -sS -X PUT "$base/releases/$release_sha?session=$session" \
           -H "Authorization: Bearer $DEPLOYS_TOKEN" \
           -H "Content-Type: application/json" \
           --data-binary @"$body_file")
@@ -781,7 +781,7 @@ runs:
            + (if ($envGroups | length) > 0 then {envGroups: $envGroups} else {} end)
            + (if $ttl > 0 then {ttl: $ttl} else {} end)')
 
-        resp=$(curl -sSf -X POST "$API/deployment.deploy" \
+        resp=$(curl -sS -X POST "$API/deployment.deploy" \
           -H "Authorization: Bearer $DEPLOYS_TOKEN" \
           -H 'Content-Type: application/json' \
           -d "$body")
@@ -790,7 +790,7 @@ runs:
           exit 1
         fi
 
-        resp=$(curl -sSf -X POST "$API/deployment.get" \
+        resp=$(curl -sS -X POST "$API/deployment.get" \
           -H "Authorization: Bearer $DEPLOYS_TOKEN" \
           -H 'Content-Type: application/json' \
           -d "$(jq -n --arg project "$PROJECT" --arg location "$LOCATION" --arg name "$DEPLOYMENT" \
@@ -852,7 +852,7 @@ runs:
            + (if $pullSecret != "" then {pullSecret: $pullSecret} else {} end)
            + (if $ttl > 0 then {ttl: $ttl} else {} end)')
 
-        resp=$(curl -sSf -X POST "$API/deployment.deploy" \
+        resp=$(curl -sS -X POST "$API/deployment.deploy" \
           -H "Authorization: Bearer $DEPLOYS_TOKEN" \
           -H 'Content-Type: application/json' \
           -d "$body")
@@ -861,7 +861,7 @@ runs:
           exit 1
         fi
 
-        resp=$(curl -sSf -X POST "$API/deployment.get" \
+        resp=$(curl -sS -X POST "$API/deployment.get" \
           -H "Authorization: Bearer $DEPLOYS_TOKEN" \
           -H 'Content-Type: application/json' \
           -d "$(jq -n --arg project "$PROJECT" --arg location "$LOCATION" --arg name "$DEPLOYMENT" \
