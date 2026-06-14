@@ -636,16 +636,16 @@ runs:
         }
 
         # --- b. walk outputDir; upload each blob; build the manifest files ----
-        # Collect "<request-path>\t<sha>\t<ct>\t<cache>" lines, then assemble the
-        # manifest with jq. request-path is the path relative to outputDir with a
-        # leading "/".
+        # Collect "<path>\t<sha>\t<ct>\t<cache>" lines, then assemble the manifest
+        # with jq. The manifest key is the logical path relative to outputDir with
+        # NO leading slash (SPEC §5.3) — the gateway normalizes request paths to
+        # this slash-less form, so a leading slash would miss every lookup.
         entries_file="$(mktemp)"
         uploaded=0
         skipped=0
 
         while IFS= read -r -d '' f; do
           rel="${f#"$out"/}"
-          reqpath="/$rel"
           sha=$(sha256sum "$f" | cut -d' ' -f1)
           lc=$(printf '%s' "$f" | lower)
           ct=$(content_type_for "$lc")
@@ -660,7 +660,7 @@ runs:
             --data-binary @"$f")
           existed=$(jq -r 'if .ok then (.result.existed // false) else "err" end' <<<"$blob_resp")
           if [ "$existed" = "err" ]; then
-            echo "::error::blob upload failed for $reqpath: $(jq -r '.error.message // "unknown error"' <<<"$blob_resp")" >&2
+            echo "::error::blob upload failed for $rel: $(jq -r '.error.message // "unknown error"' <<<"$blob_resp")" >&2
             exit 1
           fi
           if [ "$existed" = "true" ]; then
@@ -669,7 +669,7 @@ runs:
             uploaded=$((uploaded + 1))
           fi
 
-          printf '%s\t%s\t%s\t%s\n' "$reqpath" "$sha" "$ct" "$cache" >> "$entries_file"
+          printf '%s\t%s\t%s\t%s\n' "$rel" "$sha" "$ct" "$cache" >> "$entries_file"
         done < <(find "$out" -type f -print0)
 
         echo "Uploaded $uploaded blob(s), $skipped already present."
