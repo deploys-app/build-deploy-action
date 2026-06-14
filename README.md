@@ -121,8 +121,8 @@ explicitly if you need a specific value.
 | `baseUrl` | | computed | mode=static: build-time base URL; if empty the action injects the planned deploy URL |
 | `port` | | `8080` | Container port (mode=dockerfile, WebService/TCPService) |
 | `type` | | `WebService` | mode=dockerfile: `WebService`, `Worker`, `TCPService`, `InternalTCPService` |
-| `env` | | | Deployment env vars, one `KEY=VALUE` per line |
-| `envGroups` | | | Env groups to attach, one per line or comma-separated; each must already exist in the project |
+| `env` | | | Deployment env vars, one `KEY=VALUE` per line (mode=dockerfile; ignored for static — no runtime container) |
+| `envGroups` | | | Env groups to attach, one per line or comma-separated; each must already exist in the project (mode=dockerfile; ignored for static) |
 | `pullSecret` | | | Pull secret name for a private image registry (mode=dockerfile); the secret must already exist in the deploy location |
 | `previewTtl` | | `7d` | Preview TTL (`30m`, `12h`, `7d`, …), refreshed on every push |
 | `apiEndpoint` | | `https://api.deploys.app` | API endpoint |

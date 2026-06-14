@@ -104,13 +104,17 @@ inputs:
     required: false
     default: WebService
   env:
-    description: Environment variables for the deployment, one KEY=VALUE per line
+    description: >-
+      Environment variables for the deployment, one KEY=VALUE per line
+      (dockerfile mode only). Ignored in static mode — a static site has no
+      runtime container to read them.
     required: false
     default: ''
   envGroups:
     description: >-
       Env groups to attach to the deployment, one per line or comma-separated.
       Each must already exist in the project (envGroup.create / the console).
+      Dockerfile mode only — ignored in static mode (no runtime container).
     required: false
     default: ''
   pullSecret:
@@ -752,33 +756,20 @@ runs:
       run: |
         set -euo pipefail
 
-        # KEY=VALUE lines -> JSON object (empty lines ignored; any other
-        # malformed line is an error rather than silently dropped). Same parser
-        # as the container deploy step.
-        env_json=$(jq -Rn '
-          [inputs | select(length > 0)]
-          | if any(test("^[^=]+=") | not) then error("malformed line")
-            else map(capture("^(?<key>[^=]+)=(?<value>.*)$")) | from_entries end
-        ' <<<"$ENV_LINES" 2>/dev/null || true)
-        if [ -z "$env_json" ]; then
-          echo "::error::env must be KEY=VALUE lines (one per line)" >&2
-          exit 1
+        # A static site is served by the shared static-gateway with no runtime
+        # container, so env vars / env groups have nothing to read them — the API
+        # rejects them for type=Static. Don't send them; warn if the caller set
+        # them so the no-op is visible rather than silent.
+        if [ -n "${ENV_LINES//[[:space:]]/}" ] || [ -n "${ENV_GROUPS//[[:space:]]/}" ]; then
+          echo "::warning::env/envGroups are ignored for static deployments (no runtime container)"
         fi
 
-        # Env groups: one per line or comma-separated, trimmed, blanks dropped.
-        # (Static deployments carry env + env groups but no pull secret — there
-        # is no pod pulling an image.)
-        groups_json=$(printf '%s' "$ENV_GROUPS" | tr ',' '\n' | jq -Rn '
-          [inputs | gsub("^\\s+|\\s+$"; "") | select(length > 0)]')
-
-        # Static deploy: type=Static, site=<site_ref>, no image/port/registry.
+        # Static deploy: type=Static, site=<site_ref>, no image/port/registry/env.
         body=$(jq -n \
           --arg project "$PROJECT" --arg location "$LOCATION" \
           --arg name "$DEPLOYMENT" --arg site "$SITE_REF" \
-          --argjson env "$env_json" --argjson envGroups "$groups_json" \
           --argjson ttl "$TTL" \
-          '{project: $project, location: $location, name: $name, type: "Static", site: $site, env: $env}
-           + (if ($envGroups | length) > 0 then {envGroups: $envGroups} else {} end)
+          '{project: $project, location: $location, name: $name, type: "Static", site: $site}
            + (if $ttl > 0 then {ttl: $ttl} else {} end)')
 
         resp=$(curl -sS -X POST "$API/deployment.deploy" \
