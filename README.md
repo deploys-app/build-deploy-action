@@ -102,6 +102,28 @@ action runs `npm ci`/`npm install` then your `buildCommand` (default
 your framework must read its own base-path env (or pass `--base`); set `baseUrl`
 explicitly if you need a specific value.
 
+## Access control
+
+Set `requireGoogleLogin: true` to put the deployment behind Google login
+(deployment access) — the gate is enforced at the edge and programmatic/API
+clients cannot bypass it. Leave it off (the default) for a public deployment.
+With the gate on, restrict who gets in with `allowedEmails` and/or
+`allowedDomains` (one per line or comma-separated); leaving both empty admits any
+signed-in Google account. This works for both container and static deployments
+(enabling login forfeits edge caching for a static site).
+
+```yaml
+    - uses: deploys-app/build-deploy-action@v1
+      with:
+        project: my-project
+        location: gke.cluster-rcf2
+        name: web
+        port: 3000
+        protocol: h2c            # gRPC backend (WebService only)
+        requireGoogleLogin: true
+        allowedDomains: example.com
+```
+
 ## Inputs
 
 | Name | Required | Default | Description |
@@ -124,9 +146,13 @@ explicitly if you need a specific value.
 | `uploadConcurrency` | | `16` | mode=static: how many blobs to upload in parallel; raise for very large sites, set `1` to force sequential uploads |
 | `port` | | `8080` | Container port (mode=dockerfile, WebService/TCPService) |
 | `type` | | `WebService` | mode=dockerfile: `WebService`, `Worker`, `TCPService`, `InternalTCPService` |
+| `protocol` | | | mode=dockerfile, WebService: `http`, `https`, or `h2c` (HTTP/2 cleartext, e.g. gRPC); omitted → server default `http`; ignored for other types and for static |
 | `env` | | | Deployment env vars, one `KEY=VALUE` per line (mode=dockerfile; ignored for static — no runtime container) |
 | `envGroups` | | | Env groups to attach, one per line or comma-separated; each must already exist in the project (mode=dockerfile; ignored for static) |
 | `pullSecret` | | | Pull secret name for a private image registry (mode=dockerfile); the secret must already exist in the deploy location |
+| `requireGoogleLogin` | | `false` | Gate the deployment behind Google login (deployment access); public when false. Applies to container and static |
+| `allowedEmails` | | | Emails allowed through the access gate, one per line or comma-separated (only when `requireGoogleLogin: true`; empty = any signed-in Google account) |
+| `allowedDomains` | | | Email domains allowed through the access gate, one per line or comma-separated (only when `requireGoogleLogin: true`; empty = any signed-in Google account) |
 | `previewTtl` | | `7d` | Preview TTL (`30m`, `12h`, `7d`, …), refreshed on every push |
 | `apiEndpoint` | | `https://api.deploys.app` | API endpoint |
 | `registry` | | `registry.deploys.app` | Registry host (mode=dockerfile) |
