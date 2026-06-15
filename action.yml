@@ -111,6 +111,13 @@ inputs:
     description: Deployment type (WebService, Worker, TCPService, InternalTCPService)
     required: false
     default: WebService
+  protocol:
+    description: >-
+      Application protocol for a WebService (mode=dockerfile): `http` (default),
+      `https`, or `h2c` (HTTP/2 cleartext, e.g. gRPC backends). Ignored for
+      other deployment types and for static deployments.
+    required: false
+    default: ''
   env:
     description: >-
       Environment variables for the deployment, one KEY=VALUE per line
@@ -130,6 +137,27 @@ inputs:
       Pull secret name for the image registry (dockerfile mode only). Use this
       when the deployment must authenticate to a private registry; the secret
       must already exist in the deploy location. Ignored in static mode.
+    required: false
+    default: ''
+  requireGoogleLogin:
+    description: >-
+      Gate the deployment behind Google login (deployment access). Default
+      false — the deployment is public. Applies to both container and static
+      deployments; programmatic/API clients cannot bypass the gate.
+    required: false
+    default: 'false'
+  allowedEmails:
+    description: >-
+      Emails allowed through the access gate, one per line or comma-separated.
+      Only applies when requireGoogleLogin is true; empty means any signed-in
+      Google account is allowed.
+    required: false
+    default: ''
+  allowedDomains:
+    description: >-
+      Email domains allowed through the access gate (e.g. example.com), one per
+      line or comma-separated. Only applies when requireGoogleLogin is true;
+      empty means any signed-in Google account is allowed.
     required: false
     default: ''
   previewTtl:
@@ -839,6 +867,9 @@ runs:
         ENV_LINES: ${{ inputs.env }}
         ENV_GROUPS: ${{ inputs.envGroups }}
         TTL: ${{ steps.plan.outputs.ttl }}
+        REQUIRE_GOOGLE_LOGIN: ${{ inputs.requireGoogleLogin }}
+        ALLOWED_EMAILS: ${{ inputs.allowedEmails }}
+        ALLOWED_DOMAINS: ${{ inputs.allowedDomains }}
       run: |
         set -euo pipefail
 
@@ -850,13 +881,38 @@ runs:
           echo "::warning::env/envGroups are ignored for static deployments (no runtime container)"
         fi
 
+        # Access policy (deployment access). requireGoogleLogin gates the site;
+        # the allow-lists are comma/newline lists (empty = any signed-in Google
+        # account). Normalize the flag so "True"/" true " aren't silently treated
+        # as public, and surface a likely typo / ignored allow-lists rather than
+        # failing open to a public site.
+        access_json=null
+        rgl=$(printf '%s' "$REQUIRE_GOOGLE_LOGIN" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')
+        case "$rgl" in
+          true)
+            emails_json=$(printf '%s' "$ALLOWED_EMAILS" | tr ',' '\n' | jq -Rn '
+              [inputs | gsub("^\\s+|\\s+$"; "") | select(length > 0)]')
+            domains_json=$(printf '%s' "$ALLOWED_DOMAINS" | tr ',' '\n' | jq -Rn '
+              [inputs | gsub("^\\s+|\\s+$"; "") | select(length > 0)]')
+            access_json=$(jq -nc --argjson emails "$emails_json" --argjson domains "$domains_json" \
+              '{requireGoogleLogin: true, allowedEmails: $emails, allowedDomains: $domains}')
+            ;;
+          ''|false) ;;
+          *) echo "::warning::requireGoogleLogin should be 'true' or 'false' (got '$REQUIRE_GOOGLE_LOGIN'); treating as false — the site stays public" ;;
+        esac
+        if [ "$rgl" != "true" ] && { [ -n "${ALLOWED_EMAILS//[[:space:]]/}" ] || [ -n "${ALLOWED_DOMAINS//[[:space:]]/}" ]; }; then
+          echo "::warning::allowedEmails/allowedDomains are ignored because requireGoogleLogin is not true"
+        fi
+
         # Static deploy: type=Static, site=<site_ref>, no image/port/registry/env.
         body=$(jq -n \
           --arg project "$PROJECT" --arg location "$LOCATION" \
           --arg name "$DEPLOYMENT" --arg site "$SITE_REF" \
           --argjson ttl "$TTL" \
+          --argjson access "$access_json" \
           '{project: $project, location: $location, name: $name, type: "Static", site: $site}
-           + (if $ttl > 0 then {ttl: $ttl} else {} end)')
+           + (if $ttl > 0 then {ttl: $ttl} else {} end)
+           + (if $access != null then {access: $access} else {} end)')
 
         resp=$(curl -sS -X POST "$API/deployment.deploy" \
           -H "Authorization: Bearer $DEPLOYS_TOKEN" \
@@ -894,10 +950,14 @@ runs:
         IMAGE: ${{ steps.plan.outputs.image_ref }}@${{ steps.build.outputs.digest }}
         TYPE: ${{ inputs.type }}
         PORT: ${{ inputs.port }}
+        PROTOCOL: ${{ inputs.protocol }}
         ENV_LINES: ${{ inputs.env }}
         ENV_GROUPS: ${{ inputs.envGroups }}
         PULL_SECRET: ${{ inputs.pullSecret }}
         TTL: ${{ steps.plan.outputs.ttl }}
+        REQUIRE_GOOGLE_LOGIN: ${{ inputs.requireGoogleLogin }}
+        ALLOWED_EMAILS: ${{ inputs.allowedEmails }}
+        ALLOWED_DOMAINS: ${{ inputs.allowedDomains }}
       run: |
         set -euo pipefail
 
@@ -917,17 +977,51 @@ runs:
         groups_json=$(printf '%s' "$ENV_GROUPS" | tr ',' '\n' | jq -Rn '
           [inputs | gsub("^\\s+|\\s+$"; "") | select(length > 0)]')
 
+        # Protocol: validate up-front so a typo fails fast with a clear message
+        # rather than a server-side validation error mid-deploy.
+        case "$PROTOCOL" in
+          ''|http|https|h2c) ;;
+          *) echo "::error::protocol must be http, https, or h2c (got '$PROTOCOL')" >&2; exit 1;;
+        esac
+
+        # Access policy (deployment access). requireGoogleLogin gates the
+        # deployment; the allow-lists are comma/newline lists (empty = any
+        # signed-in Google account). Normalize the flag so "True"/" true " aren't
+        # silently treated as public, and surface a likely typo / ignored
+        # allow-lists rather than failing open to a public deployment.
+        access_json=null
+        rgl=$(printf '%s' "$REQUIRE_GOOGLE_LOGIN" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')
+        case "$rgl" in
+          true)
+            emails_json=$(printf '%s' "$ALLOWED_EMAILS" | tr ',' '\n' | jq -Rn '
+              [inputs | gsub("^\\s+|\\s+$"; "") | select(length > 0)]')
+            domains_json=$(printf '%s' "$ALLOWED_DOMAINS" | tr ',' '\n' | jq -Rn '
+              [inputs | gsub("^\\s+|\\s+$"; "") | select(length > 0)]')
+            access_json=$(jq -nc --argjson emails "$emails_json" --argjson domains "$domains_json" \
+              '{requireGoogleLogin: true, allowedEmails: $emails, allowedDomains: $domains}')
+            ;;
+          ''|false) ;;
+          *) echo "::warning::requireGoogleLogin should be 'true' or 'false' (got '$REQUIRE_GOOGLE_LOGIN'); treating as false — the deployment stays public" ;;
+        esac
+        if [ "$rgl" != "true" ] && { [ -n "${ALLOWED_EMAILS//[[:space:]]/}" ] || [ -n "${ALLOWED_DOMAINS//[[:space:]]/}" ]; }; then
+          echo "::warning::allowedEmails/allowedDomains are ignored because requireGoogleLogin is not true"
+        fi
+
         body=$(jq -n \
           --arg project "$PROJECT" --arg location "$LOCATION" \
           --arg name "$DEPLOYMENT" --arg image "$IMAGE" \
           --arg type "$TYPE" --argjson port "$PORT" \
+          --arg protocol "$PROTOCOL" \
           --argjson env "$env_json" --argjson envGroups "$groups_json" \
           --arg pullSecret "$PULL_SECRET" --argjson ttl "$TTL" \
+          --argjson access "$access_json" \
           '{project: $project, location: $location, name: $name, image: $image, type: $type, env: $env}
            + (if $type == "WebService" or $type == "TCPService" or $type == "InternalTCPService" then {port: $port} else {} end)
+           + (if $protocol != "" and $type == "WebService" then {protocol: $protocol} else {} end)
            + (if ($envGroups | length) > 0 then {envGroups: $envGroups} else {} end)
            + (if $pullSecret != "" then {pullSecret: $pullSecret} else {} end)
-           + (if $ttl > 0 then {ttl: $ttl} else {} end)')
+           + (if $ttl > 0 then {ttl: $ttl} else {} end)
+           + (if $access != null then {access: $access} else {} end)')
 
         resp=$(curl -sS -X POST "$API/deployment.deploy" \
           -H "Authorization: Bearer $DEPLOYS_TOKEN" \
