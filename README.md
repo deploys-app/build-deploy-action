@@ -124,6 +124,36 @@ signed-in Google account. This works for both container and static deployments
         allowedDomains: example.com
 ```
 
+## Remote BuildKit (`mode: dockerfile`)
+
+By default the container build runs on a local BuildKit started on the runner.
+Set `buildkitEndpoint` to build on a **remote BuildKit** instead — useful for a
+shared, warm builder with persistent layer cache, or to keep build load off the
+runner. The runner must be able to reach the endpoint, so this is typically a
+self-hosted runner on the same network as the builder (or a publicly
+reachable / tunnelled address).
+
+```yaml
+    - uses: deploys-app/build-deploy-action@v1
+      with:
+        project: my-project
+        location: gke.cluster-rcf2
+        name: web
+        port: 3000
+        buildkitEndpoint: tcp://buildkit.internal:1234   # mTLS below
+        buildkitCaCert: ${{ secrets.BUILDKIT_CA }}
+        buildkitCert:   ${{ secrets.BUILDKIT_CERT }}
+        buildkitKey:    ${{ secrets.BUILDKIT_KEY }}
+```
+
+A bare `tcp://` endpoint connects in **plaintext** — fine on a trusted private
+network, otherwise pass `buildkitCaCert` / `buildkitCert` / `buildkitKey` (PEM,
+from secrets; all three together) to connect over mTLS. Layer caching still uses
+the GitHub Actions cache (`type=gha`), which the remote builder must be able to
+reach; if it has no outbound access to GitHub, prefer a registry-backed cache on
+the builder side. Leaving `buildkitEndpoint` empty keeps the default local-build
+behaviour unchanged.
+
 ## Inputs
 
 | Name | Required | Default | Description |
@@ -156,6 +186,10 @@ signed-in Google account. This works for both container and static deployments
 | `previewTtl` | | `7d` | Preview TTL (`30m`, `12h`, `7d`, …), refreshed on every push |
 | `apiEndpoint` | | `https://api.deploys.app` | API endpoint |
 | `registry` | | `registry.deploys.app` | Registry host (mode=dockerfile) |
+| `buildkitEndpoint` | | | Remote BuildKit address, e.g. `tcp://buildkit.internal:1234` (mode=dockerfile); empty builds with a local BuildKit on the runner |
+| `buildkitCaCert` | | | CA certificate (PEM, from a secret) for a TLS remote BuildKit; set with `buildkitCert`/`buildkitKey` |
+| `buildkitCert` | | | Client certificate (PEM, from a secret) for a TLS remote BuildKit |
+| `buildkitKey` | | | Client private key (PEM, from a secret) for a TLS remote BuildKit |
 
 ## Outputs
 
@@ -175,7 +209,8 @@ signed-in Google account. This works for both container and static deployments
    `github.exchangeToken` for a 1-hour deploys token scoped to the linked
    service account.
 2. Reports `started` via `github.notify` (drives the GitHub deployment status).
-3. Builds with Buildx (GitHub Actions cache enabled) and pushes to
+3. Builds with Buildx (GitHub Actions cache enabled) — on a local BuildKit, or
+   on a remote one when `buildkitEndpoint` is set — and pushes to
    `registry.deploys.app/<project>/<name>:<sha>`, logging in with the same
    token.
 4. Deploys the image by digest — previews carry a rolling TTL.
