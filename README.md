@@ -148,11 +148,12 @@ reachable / tunnelled address).
 
 A bare `tcp://` endpoint connects in **plaintext** — fine on a trusted private
 network, otherwise pass `buildkitCaCert` / `buildkitCert` / `buildkitKey` (PEM,
-from secrets; all three together) to connect over mTLS. Layer caching still uses
-the GitHub Actions cache (`type=gha`), which the remote builder must be able to
-reach; if it has no outbound access to GitHub, prefer a registry-backed cache on
-the builder side. Leaving `buildkitEndpoint` empty keeps the default local-build
-behaviour unchanged.
+from secrets; all three together) to connect over mTLS. GitHub Actions layer
+cache (`type=gha`) is **off** when `buildkitEndpoint` is set (the remote
+builder's own cache is used instead) and **on** for a local builder. Override
+with `cache: true` / `cache: false`. When cache is on, the builder must be able
+to reach GitHub's cache API. Leaving `buildkitEndpoint` empty keeps the default
+local-build behaviour unchanged.
 
 ## Inputs
 
@@ -190,6 +191,7 @@ behaviour unchanged.
 | `buildkitCaCert` | | | CA certificate (PEM, from a secret) for a TLS remote BuildKit; set with `buildkitCert`/`buildkitKey` |
 | `buildkitCert` | | | Client certificate (PEM, from a secret) for a TLS remote BuildKit |
 | `buildkitKey` | | | Client private key (PEM, from a secret) for a TLS remote BuildKit |
+| `cache` | | auto | Export/import BuildKit layers via GitHub Actions cache (`type=gha`, `mode=max`). Default: on for a local builder, off when `buildkitEndpoint` is set. Override with `true`/`false`. Ignored for static |
 
 ## Outputs
 
@@ -209,10 +211,11 @@ behaviour unchanged.
    `github.exchangeToken` for a 1-hour deploys token scoped to the linked
    service account.
 2. Reports `started` via `github.notify` (drives the GitHub deployment status).
-3. Builds with Buildx (GitHub Actions cache enabled) — on a local BuildKit, or
-   on a remote one when `buildkitEndpoint` is set — and pushes to
+3. Builds with Buildx — on a local BuildKit, or on a remote one when
+   `buildkitEndpoint` is set — and pushes to
    `registry.deploys.app/<project>/<name>:<sha>`, logging in with the same
-   token.
+   token. GitHub Actions layer cache is on for a local builder and off for a
+   remote one unless `cache` overrides it.
 4. Deploys the image by digest — previews carry a rolling TTL.
 5. Reports `success` (preview URL lands on the PR) or `failure`.
 
