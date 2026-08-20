@@ -206,10 +206,10 @@ inputs:
   cache:
     description: >-
       Export/import BuildKit layers via GitHub Actions cache (`type=gha`,
-      `mode=max`). Default true. Set false to skip GHA cache (mode=dockerfile
-      only; ignored for static).
+      `mode=max`). Empty (default) means on for a local builder and off when
+      `buildkitEndpoint` is set. Set true/false to override. Ignored for static.
     required: false
-    default: 'true'
+    default: ''
 
 outputs:
   deployment:
@@ -479,6 +479,35 @@ runs:
         username: oauth2accesstoken
         password: ${{ steps.auth.outputs.deploys_token }}
 
+    - id: layer-cache
+      name: Resolve GitHub Actions layer cache
+      if: inputs.mode != 'static'
+      shell: bash
+      env:
+        CACHE: ${{ inputs.cache }}
+        BUILDKIT_ENDPOINT: ${{ inputs.buildkitEndpoint }}
+      run: |
+        set -euo pipefail
+        v=$(printf '%s' "$CACHE" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')
+        case "$v" in
+          true|1|yes) use=true ;;
+          false|0|no) use=false ;;
+          '')
+            if [ -n "$BUILDKIT_ENDPOINT" ]; then use=false; else use=true; fi
+            ;;
+          *)
+            echo "::warning::cache should be 'true' or 'false' (got '$CACHE'); using default" >&2
+            if [ -n "$BUILDKIT_ENDPOINT" ]; then use=false; else use=true; fi
+            ;;
+        esac
+        if [ "$use" = true ]; then
+          echo "from=type=gha" >> "$GITHUB_OUTPUT"
+          echo "to=type=gha,mode=max" >> "$GITHUB_OUTPUT"
+        else
+          echo "from=" >> "$GITHUB_OUTPUT"
+          echo "to=" >> "$GITHUB_OUTPUT"
+        fi
+
     - id: build
       name: Build and push
       if: inputs.mode != 'static'
@@ -489,8 +518,8 @@ runs:
         build-args: ${{ inputs.buildArgs }}
         push: true
         tags: ${{ steps.plan.outputs.image_ref }}:${{ github.sha }}
-        cache-from: ${{ inputs.cache == 'true' && 'type=gha' || '' }}
-        cache-to: ${{ inputs.cache == 'true' && 'type=gha,mode=max' || '' }}
+        cache-from: ${{ steps.layer-cache.outputs.from }}
+        cache-to: ${{ steps.layer-cache.outputs.to }}
 
     # --- static build (mode == static) ---------------------------------------
 

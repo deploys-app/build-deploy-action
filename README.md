@@ -148,11 +148,12 @@ reachable / tunnelled address).
 
 A bare `tcp://` endpoint connects in **plaintext** — fine on a trusted private
 network, otherwise pass `buildkitCaCert` / `buildkitCert` / `buildkitKey` (PEM,
-from secrets; all three together) to connect over mTLS. Layer export to GitHub
-Actions cache (`type=gha`) is controlled by `cache` (default true). Set
-`cache: false` to skip it — useful when the builder already has a persistent
-layer cache. Leaving `buildkitEndpoint` empty keeps the default local-build
-behaviour unchanged.
+from secrets; all three together) to connect over mTLS. GitHub Actions layer
+cache (`type=gha`) is **off** when `buildkitEndpoint` is set (the remote
+builder's own cache is used instead) and **on** for a local builder. Override
+with `cache: true` / `cache: false`. When cache is on, the builder must be able
+to reach GitHub's cache API. Leaving `buildkitEndpoint` empty keeps the default
+local-build behaviour unchanged.
 
 ## Inputs
 
@@ -190,7 +191,7 @@ behaviour unchanged.
 | `buildkitCaCert` | | | CA certificate (PEM, from a secret) for a TLS remote BuildKit; set with `buildkitCert`/`buildkitKey` |
 | `buildkitCert` | | | Client certificate (PEM, from a secret) for a TLS remote BuildKit |
 | `buildkitKey` | | | Client private key (PEM, from a secret) for a TLS remote BuildKit |
-| `cache` | | `true` | Export/import BuildKit layers via GitHub Actions cache (`type=gha`, `mode=max`). Set `false` to skip. Ignored for static |
+| `cache` | | auto | Export/import BuildKit layers via GitHub Actions cache (`type=gha`, `mode=max`). Default: on for a local builder, off when `buildkitEndpoint` is set. Override with `true`/`false`. Ignored for static |
 
 ## Outputs
 
@@ -213,7 +214,8 @@ behaviour unchanged.
 3. Builds with Buildx — on a local BuildKit, or on a remote one when
    `buildkitEndpoint` is set — and pushes to
    `registry.deploys.app/<project>/<name>:<sha>`, logging in with the same
-   token. GitHub Actions layer cache is on unless `cache` is `false`.
+   token. GitHub Actions layer cache is on for a local builder and off for a
+   remote one unless `cache` overrides it.
 4. Deploys the image by digest — previews carry a rolling TTL.
 5. Reports `success` (preview URL lands on the PR) or `failure`.
 
