@@ -148,10 +148,10 @@ reachable / tunnelled address).
 
 A bare `tcp://` endpoint connects in **plaintext** — fine on a trusted private
 network, otherwise pass `buildkitCaCert` / `buildkitCert` / `buildkitKey` (PEM,
-from secrets; all three together) to connect over mTLS. Layer caching still uses
-the GitHub Actions cache (`type=gha`), which the remote builder must be able to
-reach; if it has no outbound access to GitHub, prefer a registry-backed cache on
-the builder side. Leaving `buildkitEndpoint` empty keeps the default local-build
+from secrets; all three together) to connect over mTLS. Layer export to GitHub
+Actions cache (`type=gha`) is controlled by `cache` (default true). Set
+`cache: false` to skip it — useful when the builder already has a persistent
+layer cache. Leaving `buildkitEndpoint` empty keeps the default local-build
 behaviour unchanged.
 
 ## Inputs
@@ -190,6 +190,7 @@ behaviour unchanged.
 | `buildkitCaCert` | | | CA certificate (PEM, from a secret) for a TLS remote BuildKit; set with `buildkitCert`/`buildkitKey` |
 | `buildkitCert` | | | Client certificate (PEM, from a secret) for a TLS remote BuildKit |
 | `buildkitKey` | | | Client private key (PEM, from a secret) for a TLS remote BuildKit |
+| `cache` | | `true` | Export/import BuildKit layers via GitHub Actions cache (`type=gha`, `mode=max`). Set `false` to skip. Ignored for static |
 
 ## Outputs
 
@@ -209,10 +210,10 @@ behaviour unchanged.
    `github.exchangeToken` for a 1-hour deploys token scoped to the linked
    service account.
 2. Reports `started` via `github.notify` (drives the GitHub deployment status).
-3. Builds with Buildx (GitHub Actions cache enabled) — on a local BuildKit, or
-   on a remote one when `buildkitEndpoint` is set — and pushes to
+3. Builds with Buildx — on a local BuildKit, or on a remote one when
+   `buildkitEndpoint` is set — and pushes to
    `registry.deploys.app/<project>/<name>:<sha>`, logging in with the same
-   token.
+   token. GitHub Actions layer cache is on unless `cache` is `false`.
 4. Deploys the image by digest — previews carry a rolling TTL.
 5. Reports `success` (preview URL lands on the PR) or `failure`.
 

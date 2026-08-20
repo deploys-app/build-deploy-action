@@ -203,6 +203,13 @@ inputs:
       from a secret. See `buildkitCaCert`.
     required: false
     default: ''
+  cache:
+    description: >-
+      Export/import BuildKit layers via GitHub Actions cache (`type=gha`,
+      `mode=max`). Default true. Set false to skip GHA cache (mode=dockerfile
+      only; ignored for static).
+    required: false
+    default: 'true'
 
 outputs:
   deployment:
@@ -482,8 +489,8 @@ runs:
         build-args: ${{ inputs.buildArgs }}
         push: true
         tags: ${{ steps.plan.outputs.image_ref }}:${{ github.sha }}
-        cache-from: type=gha
-        cache-to: type=gha,mode=max
+        cache-from: ${{ inputs.cache == 'true' && 'type=gha' || '' }}
+        cache-to: ${{ inputs.cache == 'true' && 'type=gha,mode=max' || '' }}
 
     # --- static build (mode == static) ---------------------------------------
 
